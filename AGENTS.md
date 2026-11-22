@@ -10,7 +10,7 @@
 
 ```bash
 cargo run -p frogcalc-app                 # dev UI (debug build keeps a console for logs)
-cargo test -p frogcalc-core               # 27 core tests
+cargo test -p frogcalc-core               # 28 core tests
 cargo check -p frogcalc-app               # faster UI compile check
 cargo fmt --all                           # requires rustfmt component
 cargo build --release -p frogcalc-app     # release GUI, no console
@@ -53,7 +53,7 @@ No CI, pre-commit, lint, or typecheck config exists. Do not invent one.
 - `crates/frogcalc-core/src/symbolic/format_expr.rs` is included with `include!("format_expr.rs")` inside `symbolic/expr.rs`. It is one module; edit both together.
 - `symbolic/transform.rs` handles expand/simplify/factor; `factor_int.rs` implements Berlekamp–Zassenhaus (mod-p Berlekamp + Hensel lifting via linear congruences + Zassenhaus recombination); `polynomial.rs` handles square-free decomposition, rational roots, quadratic formulas and Durand–Kerner; `calculus/integrate.rs` is rule-based (partial fractions with multiplicities, log-derivative matching) and returns an unevaluated `integrate(...)` call when unsupported.
 - `symbolic/assume.rs` stores per-symbol sign facts. `Session::format_value` and the `simplify/expand/factor` builtins apply `Assumptions::rewrite`; stored workspace expressions are never rewritten. Assumptions round-trip through `workspace_source` as `assume(x > 0)` lines.
-- `plot.rs` samples expressions through `Session::compile_expression` + `Session::eval_sample` (bindings become `Float`), so user functions and `piecewise` work in plots; the app renders 2D polylines and 3D height fields with the egui painter (no extra crates).
+- `plot.rs` samples expressions through `Session::compile_plot_expr` (expands user functions/globals to an `Expr`) and a lightweight `f64` evaluator, falling back to `Session::eval_sample` for unsupported forms. `compile_plot` classifies input as explicit/implicit: `y = f(x)`, `z = f(x,y)`, `lhs = rhs`/`==` equations, and bare expressions containing `y` (2D) or `z` (3D). Implicit zero level sets use marching triangles (2D) / marching tetrahedra (3D), with auto range fitting. Plot parameters auto-refresh from `PlotState::signature()` with a short debounce (`plot_dirty_since`); fixed-y clipping is reported in the UI.
 - `numeric/recurring.rs` parses recurring-decimal text (`recurring("0.1(3)")`) with the geometric-series formula `I + N/10^n + R/(10^n(10^m-1))`, returning an exact `BigRational`; `()` and `[]` mark the repeating block, and `recurring` is a reserved builtin that also accepts an ordinary numeric literal.
 - Parser semantics: `=` is assignment/function definition, `==` is an equation for `solve` (and equality in conditions); implicit multiplication is supported; `;` separates statements and suppresses that statement's output; newlines are allowed inside `()`/`{}`.
 - Script control flow: `if`/`else if`/`else`, `while`, `for x in range(...) | {list} { ... }`, plus `break`/`continue`. `eval_statement_value` returns an internal `Flow` enum (`Value`/`Break`/`Continue`); `Session.loop_depth` rejects `break` outside loops and is reset to 0 across function-call boundaries. Conditions use `< <= > >= != ==` and short-circuiting `and`/`or`/`not`. Comparisons are parsed into `lt/le/gt/ge/neq/and/or/not` calls and printed back as infix, so they round-trip through `workspace_source`. Control statements return `None` from `eval_statement` (no display result) and loop iterations are capped at 100000.

@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use frogcalc_core::eval::session::{
     AngleMode, DisplayMode, ExecResult, Session, Settings, WorkspaceItem,
 };
-use frogcalc_core::plot::{sample_2d, sample_surface, should_break};
+use frogcalc_core::plot::{
+    compile_plot, sample_2d, sample_implicit_2d, sample_implicit_3d, sample_surface, should_break,
+    PlotKind,
+};
 
 static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
 
@@ -305,12 +308,36 @@ struct PlotState {
     x_max: f64,
     y_min: f64,
     y_max: f64,
+    #[serde(default = "default_z_min")]
+    z_min: f64,
+    #[serde(default = "default_z_max")]
+    z_max: f64,
     samples: usize,
     surface_side: usize,
+    #[serde(default = "default_iso_side_2d")]
+    implicit_side_2d: usize,
+    #[serde(default = "default_iso_side_3d")]
+    implicit_side_3d: usize,
     #[serde(default = "default_true")]
     auto_y: bool,
     #[serde(default)]
     wireframe: bool,
+}
+
+fn default_z_min() -> f64 {
+    -10.0
+}
+
+fn default_z_max() -> f64 {
+    10.0
+}
+
+fn default_iso_side_2d() -> usize {
+    140
+}
+
+fn default_iso_side_3d() -> usize {
+    26
 }
 
 fn default_dimension() -> String {
@@ -330,8 +357,12 @@ impl Default for PlotState {
             x_max: 10.0,
             y_min: -10.0,
             y_max: 10.0,
+            z_min: -10.0,
+            z_max: 10.0,
             samples: 800,
             surface_side: 44,
+            implicit_side_2d: 140,
+            implicit_side_3d: 26,
             auto_y: true,
             wireframe: false,
         }
@@ -345,15 +376,19 @@ impl PlotState {
 
     fn signature(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.expression,
             self.dimension,
             self.x_min,
             self.x_max,
             self.y_min,
             self.y_max,
+            self.z_min,
+            self.z_max,
             self.samples,
             self.surface_side,
+            self.implicit_side_2d,
+            self.implicit_side_3d,
             self.auto_y,
             self.wireframe
         )
@@ -363,12 +398,28 @@ impl PlotState {
 #[derive(Clone, Debug)]
 enum PlotData {
     Curve(Vec<Option<(f64, f64)>>),
+    ImplicitCurve {
+        segments: Vec<[(f64, f64); 2]>,
+        x0: f64,
+        x1: f64,
+        y0: f64,
+        y1: f64,
+    },
     Surface {
         values: Vec<Option<f64>>,
         nx: usize,
         ny: usize,
         y0: f64,
         y1: f64,
+    },
+    ImplicitSurface {
+        triangles: Vec<[[f64; 3]; 3]>,
+        x0: f64,
+        x1: f64,
+        y0: f64,
+        y1: f64,
+        z0: f64,
+        z1: f64,
     },
     Error(String),
 }
@@ -429,6 +480,9 @@ struct FrogApp {
     plot: PlotState,
     plot_data: Option<PlotData>,
     plot_signature: String,
+    plot_dirty_since: Option<Instant>,
+    plot_kind: Option<PlotKind>,
+    plot_fit_key: String,
     plot_yaw: f32,
     plot_pitch: f32,
     focus_plot: bool,
@@ -475,6 +529,9 @@ impl FrogApp {
             plot: saved.plot,
             plot_data: None,
             plot_signature: String::new(),
+            plot_dirty_since: None,
+            plot_kind: None,
+            plot_fit_key: String::new(),
             plot_yaw: -0.6,
             plot_pitch: 0.55,
             focus_plot: mode_is_plot,
@@ -531,7 +588,7 @@ impl FrogApp {
         } else if self.is_plot() {
             self.focus_plot = true;
             if self.plot_data.is_none() {
-                self.run_plot();
+                self.run_plot(true, true);
             }
         } else {
             self.focus_input = true;
@@ -569,57 +626,298 @@ impl FrogApp {
     // 绘图
     // -----------------------------------------------------------------------
 
-    fn run_plot(&mut self) {
-        let node = match self.session.compile_expression(&self.plot.expression) {
-            Ok(node) => node,
+    fn run_plot(&mut self, persist: bool, allow_dimension_switch: bool) {
+        let mut target = compile_plot(&self.plot.expression, self.plot.is_3d());
+        // 2D 下输入含 z 的方程/表达式时自动切到 3D，避免“明明支持却报错”。
+        // 手动点击 2D/3D 时不允许自动切回，否则按钮会失效。
+        if allow_dimension_switch && target.is_err() && !self.plot.is_3d() {
+            if let Ok(candidate) = compile_plot(&self.plot.expression, true) {
+                if candidate.kind == PlotKind::Implicit3D || candidate.kind == PlotKind::Explicit3D
+                {
+                    self.plot.dimension = "3d".into();
+                    target = Ok(candidate);
+                }
+            }
+        }
+        let target = match target {
+            Ok(target) => target,
             Err(error) => {
+                self.plot_kind = None;
                 self.plot_data = Some(PlotData::Error(error.message));
                 self.plot_signature = self.plot.signature();
                 return;
             }
         };
-        if self.plot.is_3d() {
-            let surface = sample_surface(
-                &mut self.session,
-                &node,
-                "x",
-                "y",
-                self.plot.x_min,
-                self.plot.x_max,
-                self.plot.y_min,
-                self.plot.y_max,
-                self.plot.surface_side,
-            );
-            self.plot_data = Some(PlotData::Surface {
-                values: surface.values,
-                nx: surface.nx,
-                ny: surface.ny,
-                y0: surface.y0,
-                y1: surface.y1,
-            });
-        } else {
-            let curve = sample_2d(
-                &mut self.session,
-                &node,
-                "x",
-                self.plot.x_min,
-                self.plot.x_max,
-                self.plot.samples,
-            );
-            self.plot_data = Some(PlotData::Curve(curve.points));
+        self.plot_kind = Some(target.kind);
+        self.sample_plot(target.kind, &target.node);
+        // 第一次绘制某个隐函数时，按曲面包围盒自动缩放，避免球面在 [-10,10]^3 里只有一个点。
+        if target.kind.is_implicit() {
+            let key = format!("{}|{}", self.plot.expression.trim(), self.plot.is_3d());
+            if self.plot_fit_key != key {
+                self.plot_fit_key = key.clone();
+                // 旧范围完全不含零等值面时，先回到默认范围再采样一次。
+                if self.implicit_data_empty() && !self.ranges_are_default() {
+                    self.reset_plot_ranges();
+                    self.plot_fit_key = key;
+                    self.sample_plot(target.kind, &target.node);
+                }
+                if self.fit_ranges_from_data(true) {
+                    self.sample_plot(target.kind, &target.node);
+                }
+            }
         }
         self.plot_signature = self.plot.signature();
-        self.save();
+        if persist {
+            self.save();
+        }
+    }
+
+    fn implicit_data_empty(&self) -> bool {
+        match &self.plot_data {
+            Some(PlotData::ImplicitCurve { segments, .. }) => segments.is_empty(),
+            Some(PlotData::ImplicitSurface { triangles, .. }) => triangles.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn ranges_are_default(&self) -> bool {
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let planar = near(self.plot.x_min, -10.0)
+            && near(self.plot.x_max, 10.0)
+            && near(self.plot.y_min, -10.0)
+            && near(self.plot.y_max, 10.0);
+        planar
+            && (!self.plot.is_3d() || (near(self.plot.z_min, -10.0) && near(self.plot.z_max, 10.0)))
+    }
+
+    fn sample_plot(&mut self, kind: PlotKind, node: &frogcalc_core::parser::Node) {
+        match kind {
+            PlotKind::Explicit2D => {
+                let curve = sample_2d(
+                    &mut self.session,
+                    node,
+                    "x",
+                    self.plot.x_min,
+                    self.plot.x_max,
+                    self.plot.samples,
+                );
+                self.plot_data = Some(PlotData::Curve(curve.points));
+            }
+            PlotKind::Explicit3D => {
+                let surface = sample_surface(
+                    &mut self.session,
+                    node,
+                    "x",
+                    "y",
+                    self.plot.x_min,
+                    self.plot.x_max,
+                    self.plot.y_min,
+                    self.plot.y_max,
+                    self.plot.surface_side,
+                );
+                self.plot_data = Some(PlotData::Surface {
+                    values: surface.values,
+                    nx: surface.nx,
+                    ny: surface.ny,
+                    y0: surface.y0,
+                    y1: surface.y1,
+                });
+            }
+            PlotKind::Implicit2D => {
+                let sampled = sample_implicit_2d(
+                    &mut self.session,
+                    node,
+                    "x",
+                    "y",
+                    self.plot.x_min,
+                    self.plot.x_max,
+                    self.plot.y_min,
+                    self.plot.y_max,
+                    self.plot.implicit_side_2d,
+                );
+                self.plot_data = Some(PlotData::ImplicitCurve {
+                    segments: sampled.segments,
+                    x0: sampled.x0,
+                    x1: sampled.x1,
+                    y0: sampled.y0,
+                    y1: sampled.y1,
+                });
+            }
+            PlotKind::Implicit3D => {
+                let sampled = sample_implicit_3d(
+                    &mut self.session,
+                    node,
+                    "x",
+                    "y",
+                    "z",
+                    self.plot.x_min,
+                    self.plot.x_max,
+                    self.plot.y_min,
+                    self.plot.y_max,
+                    self.plot.z_min,
+                    self.plot.z_max,
+                    self.plot.implicit_side_3d,
+                );
+                self.plot_data = Some(PlotData::ImplicitSurface {
+                    triangles: sampled.triangles,
+                    x0: sampled.x0,
+                    x1: sampled.x1,
+                    y0: sampled.y0,
+                    y1: sampled.y1,
+                    z0: sampled.z0,
+                    z1: sampled.z1,
+                });
+            }
+        }
+    }
+
+    /// 用当前隐函数数据计算包围盒；`only_if_small` 为真时只在曲面明显小于视窗时缩放。
+    fn fit_ranges_from_data(&mut self, only_if_small: bool) -> bool {
+        let mut low = [f64::INFINITY; 3];
+        let mut high = [f64::NEG_INFINITY; 3];
+        let mut any = false;
+        let mut include = |point: [f64; 3]| {
+            for axis in 0..3 {
+                low[axis] = low[axis].min(point[axis]);
+                high[axis] = high[axis].max(point[axis]);
+            }
+            any = true;
+        };
+        match &self.plot_data {
+            Some(PlotData::ImplicitCurve { segments, .. }) => {
+                for segment in segments {
+                    for (x, y) in segment {
+                        include([*x, *y, 0.0]);
+                    }
+                }
+            }
+            Some(PlotData::ImplicitSurface { triangles, .. }) => {
+                for triangle in triangles {
+                    for point in triangle {
+                        include(*point);
+                    }
+                }
+            }
+            _ => return false,
+        }
+        if !any || !low[0].is_finite() {
+            return false;
+        }
+        let view = [
+            (self.plot.x_max - self.plot.x_min).abs(),
+            (self.plot.y_max - self.plot.y_min).abs(),
+            (self.plot.z_max - self.plot.z_min).abs(),
+        ];
+        let surface = [
+            (high[0] - low[0]).max(0.0),
+            (high[1] - low[1]).max(0.0),
+            (high[2] - low[2]).max(0.0),
+        ];
+        if only_if_small {
+            let surface_diagonal =
+                (surface[0] * surface[0] + surface[1] * surface[1] + surface[2] * surface[2])
+                    .sqrt();
+            let view_diagonal = if self.plot.is_3d() {
+                (view[0] * view[0] + view[1] * view[1] + view[2] * view[2]).sqrt()
+            } else {
+                (view[0] * view[0] + view[1] * view[1]).sqrt()
+            };
+            if view_diagonal > 0.0 && surface_diagonal > view_diagonal * 0.55 {
+                return false;
+            }
+        }
+        let pad = |span: f64| {
+            if span > 1e-9 {
+                span * 0.08
+            } else {
+                0.5
+            }
+        };
+        let (x0, x1) = (low[0] - pad(surface[0]), high[0] + pad(surface[0]));
+        let (y0, y1) = (low[1] - pad(surface[1]), high[1] + pad(surface[1]));
+        self.plot.x_min = x0;
+        self.plot.x_max = x1;
+        self.plot.y_min = y0;
+        self.plot.y_max = y1;
+        if self.plot.is_3d() {
+            let (z0, z1) = (low[2] - pad(surface[2]), high[2] + pad(surface[2]));
+            self.plot.z_min = z0;
+            self.plot.z_max = z1;
+        }
+        true
+    }
+
+    fn auto_fit_plot(&mut self) {
+        if self.fit_ranges_from_data(false) {
+            self.run_plot(true, true);
+        }
+    }
+
+    fn reset_plot_ranges(&mut self) {
+        self.plot.x_min = -10.0;
+        self.plot.x_max = 10.0;
+        self.plot.y_min = -10.0;
+        self.plot.y_max = 10.0;
+        self.plot.z_min = -10.0;
+        self.plot.z_max = 10.0;
+        self.plot.auto_y = true;
+        self.plot_fit_key.clear();
+    }
+
+    /// 参数变化后自动重采样：2D 快速刷新，3D 略微延迟以免拖动时卡顿。
+    fn auto_refresh_plot(&mut self, ctx: &egui::Context) {
+        if self.plot_data.is_none() {
+            self.run_plot(false, true);
+            self.plot_dirty_since = None;
+            ctx.request_repaint();
+            return;
+        }
+        if self.plot_signature == self.plot.signature() {
+            self.plot_dirty_since = None;
+            return;
+        }
+        let delay_ms = if self.plot.is_3d() { 220 } else { 60 };
+        let ready = self.plot_dirty_since.map_or(false, |since| {
+            since.elapsed() >= Duration::from_millis(delay_ms)
+        });
+        if ready {
+            self.run_plot(false, true);
+            self.plot_dirty_since = None;
+            ctx.request_repaint();
+        } else {
+            if self.plot_dirty_since.is_none() {
+                self.plot_dirty_since = Some(Instant::now());
+            }
+            ctx.request_repaint_after(Duration::from_millis(delay_ms));
+        }
     }
 
     fn plot_view(&mut self, ui: &mut egui::Ui) {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("y =").size(15.0).color(accent()));
+            let three_d = self.plot.is_3d();
+            let implicit = self.plot_kind.is_some_and(|kind| kind.is_implicit());
+            ui.label(
+                RichText::new(if implicit {
+                    "F ="
+                } else if three_d {
+                    "z ="
+                } else {
+                    "y ="
+                })
+                .size(15.0)
+                .color(accent()),
+            );
             let width = (ui.available_width() - 230.0).max(150.0);
             let response = ui.add(
                 TextEdit::singleline(&mut self.plot.expression)
-                    .hint_text("例如 sin(x)、x^2 - 2、x^2 - y^2")
+                    .hint_text(if implicit {
+                        "例如 x^2 + y^2 + z^2 = 1、x^2 + y^2 - 1"
+                    } else if three_d {
+                        "例如 x^2 - y^2、sin(x)*cos(y)"
+                    } else {
+                        "例如 sin(x)、x^2 - 2"
+                    })
                     .font(TextStyle::Monospace)
                     .text_color(text())
                     .background_color(panel2())
@@ -637,18 +935,46 @@ impl FrogApp {
                 .clicked()
                 || enter
             {
-                self.run_plot();
+                self.run_plot(true, true);
             }
             if ui.selectable_label(!self.plot.is_3d(), "2D").clicked() {
                 self.plot.dimension = "2d".into();
-                self.run_plot();
+                self.run_plot(true, false);
             }
             if ui.selectable_label(self.plot.is_3d(), "3D").clicked() {
                 self.plot.dimension = "3d".into();
-                self.run_plot();
+                self.run_plot(true, false);
+            }
+        });
+        ui.add_space(3.0);
+        let detected_implicit = self.plot_kind.is_some_and(|kind| kind.is_implicit());
+        let has_error = matches!(&self.plot_data, Some(PlotData::Error(_)));
+        ui.horizontal(|ui| {
+            let (label, color) = if has_error {
+                ("输入无法绘制", danger())
+            } else {
+                match self.plot_kind {
+                    Some(PlotKind::Implicit2D) => ("隐函数 F(x, y) = 0", violet()),
+                    Some(PlotKind::Implicit3D) => ("隐函数 F(x, y, z) = 0", violet()),
+                    Some(PlotKind::Explicit3D) => ("显式曲面 z = f(x, y)", accent()),
+                    Some(PlotKind::Explicit2D) => ("显式曲线 y = f(x)", accent()),
+                    None => ("识别中…", dim()),
+                }
+            };
+            badge(ui, label, color);
+            if !detected_implicit && !has_error {
+                let hint = if self.plot.is_3d() {
+                    "输入含 z，或输入 x^2 + y^2 + z^2 = 1 这类方程时，会自动按隐函数 F(x, y, z) = 0 绘制"
+                } else {
+                    "输入含 y 时，会自动按隐函数 F(x, y) = 0 绘制"
+                };
+                ui.label(RichText::new(hint).size(9.0).color(dim()));
             }
         });
         ui.add_space(4.0);
+        let kind = self.plot_kind;
+        let implicit2d = matches!(kind, Some(PlotKind::Implicit2D));
+        let implicit3d = matches!(kind, Some(PlotKind::Implicit3D));
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("x ∈").size(10.0).color(dim()));
             ui.add(
@@ -679,9 +1005,75 @@ impl FrogApp {
                         .max_decimals(2)
                         .range(-1.0e6..=1.0e6),
                 );
-                ui.label(RichText::new("网格").size(10.0).color(dim()));
-                ui.add(egui::DragValue::new(&mut self.plot.surface_side).range(8..=80));
-                ui.checkbox(&mut self.plot.wireframe, RichText::new("线框").size(10.0));
+                if implicit3d {
+                    ui.label(RichText::new("z ∈").size(10.0).color(dim()));
+                    ui.add(
+                        egui::DragValue::new(&mut self.plot.z_min)
+                            .speed(0.1)
+                            .max_decimals(2)
+                            .range(-1.0e6..=1.0e6),
+                    );
+                    ui.label(RichText::new("→").size(10.0).color(dim()));
+                    ui.add(
+                        egui::DragValue::new(&mut self.plot.z_max)
+                            .speed(0.1)
+                            .max_decimals(2)
+                            .range(-1.0e6..=1.0e6),
+                    );
+                    ui.label(RichText::new("分辨率").size(10.0).color(dim()));
+                    ui.add(egui::DragValue::new(&mut self.plot.implicit_side_3d).range(8..=64));
+                    if ui
+                        .small_button(RichText::new("自动范围").size(9.5).color(dim()))
+                        .on_hover_text("把 x / y / z 范围缩放到曲面附近")
+                        .clicked()
+                    {
+                        self.auto_fit_plot();
+                    }
+                    if ui
+                        .small_button(RichText::new("重置").size(9.5).color(dim()))
+                        .on_hover_text("把 x / y / z 范围恢复为 [-10, 10] 后再自动适应")
+                        .clicked()
+                    {
+                        self.reset_plot_ranges();
+                        self.run_plot(true, true);
+                    }
+                } else {
+                    ui.label(RichText::new("网格").size(10.0).color(dim()));
+                    ui.add(egui::DragValue::new(&mut self.plot.surface_side).range(8..=80));
+                    ui.checkbox(&mut self.plot.wireframe, RichText::new("线框").size(10.0));
+                }
+            } else if implicit2d {
+                ui.label(RichText::new("y ∈").size(10.0).color(dim()));
+                ui.add(
+                    egui::DragValue::new(&mut self.plot.y_min)
+                        .speed(0.1)
+                        .max_decimals(2)
+                        .range(-1.0e6..=1.0e6),
+                );
+                ui.label(RichText::new("→").size(10.0).color(dim()));
+                ui.add(
+                    egui::DragValue::new(&mut self.plot.y_max)
+                        .speed(0.1)
+                        .max_decimals(2)
+                        .range(-1.0e6..=1.0e6),
+                );
+                ui.label(RichText::new("分辨率").size(10.0).color(dim()));
+                ui.add(egui::DragValue::new(&mut self.plot.implicit_side_2d).range(40..=320));
+                if ui
+                    .small_button(RichText::new("自动范围").size(9.5).color(dim()))
+                    .on_hover_text("把 x / y 范围缩放到曲线附近")
+                    .clicked()
+                {
+                    self.auto_fit_plot();
+                }
+                if ui
+                    .small_button(RichText::new("重置").size(9.5).color(dim()))
+                    .on_hover_text("把 x / y 范围恢复为 [-10, 10] 后再自动适应")
+                    .clicked()
+                {
+                    self.reset_plot_ranges();
+                    self.run_plot(true, true);
+                }
             } else {
                 ui.checkbox(
                     &mut self.plot.auto_y,
@@ -702,22 +1094,58 @@ impl FrogApp {
                             .max_decimals(2)
                             .range(-1.0e6..=1.0e6),
                     );
+                    if ui
+                        .small_button(RichText::new("自动").size(9.5).color(dim()))
+                        .on_hover_text("按采样数据自动确定 y 范围")
+                        .clicked()
+                    {
+                        self.plot.auto_y = true;
+                    }
                 }
                 ui.label(RichText::new("采样").size(10.0).color(dim()));
                 ui.add(egui::DragValue::new(&mut self.plot.samples).range(32..=4000));
             }
-            if self.plot_signature != self.plot.signature() {
+        });
+
+        // 固定 y 范围时提示裁剪，避免误以为曲线消失。
+        let clipped = match &self.plot_data {
+            Some(PlotData::Curve(points)) if !self.plot.auto_y => points
+                .iter()
+                .flatten()
+                .any(|(_, y)| *y < self.plot.y_min || *y > self.plot.y_max),
+            _ => false,
+        };
+        if clipped {
+            ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("参数已修改，点击「绘制」更新")
+                    RichText::new("部分曲线超出当前 y 范围，已被裁剪")
+                        .size(9.5)
+                        .color(warn()),
+                );
+                if ui
+                    .small_button(RichText::new("自动 y").size(9.5).color(dim()))
+                    .clicked()
+                {
+                    self.plot.auto_y = true;
+                }
+            });
+        }
+        if self.plot_kind.is_some_and(|kind| kind.is_implicit()) {
+            let empty = match &self.plot_data {
+                Some(PlotData::ImplicitCurve { segments, .. }) => segments.is_empty(),
+                Some(PlotData::ImplicitSurface { triangles, .. }) => triangles.is_empty(),
+                _ => false,
+            };
+            if empty {
+                ui.label(
+                    RichText::new("当前范围内没有找到 F = 0 的等值面，试试「自动范围」或扩大范围")
                         .size(9.5)
                         .color(warn()),
                 );
             }
-        });
-        ui.add_space(5.0);
-        if self.plot_data.is_none() {
-            self.run_plot();
         }
+        ui.add_space(5.0);
+        self.auto_refresh_plot(ui.ctx());
         let height = (ui.available_height() - 26.0).max(180.0);
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height),
@@ -747,6 +1175,15 @@ impl FrogApp {
                     self.plot.y_max,
                 );
             }
+            Some(PlotData::ImplicitCurve {
+                segments,
+                x0,
+                x1,
+                y0,
+                y1,
+            }) => {
+                draw_implicit_curve(&painter, rect, &segments, x0, x1, y0, y1);
+            }
             Some(PlotData::Surface {
                 values,
                 nx,
@@ -774,29 +1211,72 @@ impl FrogApp {
                     self.plot.wireframe,
                 );
             }
+            Some(PlotData::ImplicitSurface {
+                triangles,
+                x0,
+                x1,
+                y0,
+                y1,
+                z0,
+                z1,
+            }) => {
+                if response.dragged() {
+                    self.plot_yaw += response.drag_delta().x * 0.01;
+                    self.plot_pitch =
+                        (self.plot_pitch + response.drag_delta().y * 0.01).clamp(-1.45, 1.45);
+                }
+                draw_implicit_surface(
+                    &painter,
+                    rect,
+                    &triangles,
+                    x0,
+                    x1,
+                    y0,
+                    y1,
+                    z0,
+                    z1,
+                    self.plot_yaw,
+                    self.plot_pitch,
+                );
+            }
             None => {}
         }
         ui.add_space(3.0);
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(if self.plot.is_3d() {
-                    "3D 曲面 · 拖动旋转视角 · z 轴按数据自动缩放"
-                } else {
-                    "2D 曲线 · 函数、分段函数与用户函数都可绘制"
-                })
-                .size(9.0)
-                .color(dim()),
-            );
+            let hint = match self.plot_kind {
+                Some(PlotKind::Implicit3D) => "3D 隐函数曲面 F(x, y, z) = 0 · 拖动旋转视角",
+                Some(PlotKind::Implicit2D) => "2D 隐函数曲线 F(x, y) = 0 · 扫描零等值线",
+                Some(PlotKind::Explicit3D) => {
+                    "3D 曲面 z = f(x, y) · 拖动旋转视角 · z 轴按数据自动缩放"
+                }
+                _ => "2D 曲线 y = f(x) · 函数、分段函数与用户函数都可绘制",
+            };
+            ui.label(RichText::new(hint).size(9.0).color(dim()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "x ∈ [{}, {}]",
-                        trim_number(self.plot.x_min),
-                        trim_number(self.plot.x_max)
-                    ))
-                    .size(9.0)
-                    .color(dim()),
+                let implicit2d = matches!(self.plot_kind, Some(PlotKind::Implicit2D));
+                let y_text = if self.plot.is_3d() || implicit2d || !self.plot.auto_y {
+                    format!(
+                        "y ∈ [{}, {}]",
+                        trim_number(self.plot.y_min),
+                        trim_number(self.plot.y_max)
+                    )
+                } else {
+                    "y 自动".to_string()
+                };
+                let mut ranges = format!(
+                    "x ∈ [{}, {}] · {}",
+                    trim_number(self.plot.x_min),
+                    trim_number(self.plot.x_max),
+                    y_text
                 );
+                if matches!(self.plot_kind, Some(PlotKind::Implicit3D)) {
+                    ranges.push_str(&format!(
+                        " · z ∈ [{}, {}]",
+                        trim_number(self.plot.z_min),
+                        trim_number(self.plot.z_max)
+                    ));
+                }
+                ui.label(RichText::new(ranges).size(9.0).color(dim()));
             });
         });
     }
@@ -2184,6 +2664,65 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
 }
 
+fn plot_area(rect: egui::Rect) -> egui::Rect {
+    rect.shrink2(egui::vec2(34.0, 16.0))
+}
+
+fn draw_axes_grid(painter: &egui::Painter, area: egui::Rect, x0: f64, x1: f64, y0: f64, y1: f64) {
+    let to_x = |x: f64| area.left() + ((x - x0) / (x1 - x0)) as f32 * area.width();
+    let to_y = |y: f64| area.bottom() - ((y - y0) / (y1 - y0)) as f32 * area.height();
+    let step_x = nice_step(x1 - x0);
+    let step_y = nice_step(y1 - y0);
+    let grid = Color32::from_rgba_unmultiplied(border().r(), border().g(), border().b(), 140);
+    let mut gx = (x0 / step_x).ceil() * step_x;
+    while gx <= x1 {
+        let px = to_x(gx);
+        painter.line_segment(
+            [egui::pos2(px, area.top()), egui::pos2(px, area.bottom())],
+            Stroke::new(1.0, grid),
+        );
+        painter.text(
+            egui::pos2(px + 2.0, area.bottom() + 2.0),
+            egui::Align2::LEFT_TOP,
+            trim_number(gx),
+            egui::FontId::proportional(8.5),
+            dim(),
+        );
+        gx += step_x;
+    }
+    let mut gy = (y0 / step_y).ceil() * step_y;
+    while gy <= y1 {
+        let py = to_y(gy);
+        painter.line_segment(
+            [egui::pos2(area.left(), py), egui::pos2(area.right(), py)],
+            Stroke::new(1.0, grid),
+        );
+        painter.text(
+            egui::pos2(area.left() - 3.0, py),
+            egui::Align2::RIGHT_CENTER,
+            trim_number(gy),
+            egui::FontId::proportional(8.5),
+            dim(),
+        );
+        gy += step_y;
+    }
+    let axis = Stroke::new(1.2, muted());
+    if x0 <= 0.0 && x1 >= 0.0 {
+        let px = to_x(0.0);
+        painter.line_segment(
+            [egui::pos2(px, area.top()), egui::pos2(px, area.bottom())],
+            axis,
+        );
+    }
+    if y0 <= 0.0 && y1 >= 0.0 {
+        let py = to_y(0.0);
+        painter.line_segment(
+            [egui::pos2(area.left(), py), egui::pos2(area.right(), py)],
+            axis,
+        );
+    }
+}
+
 fn draw_curve(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -2194,7 +2733,7 @@ fn draw_curve(
     fixed_y_min: f64,
     fixed_y_max: f64,
 ) {
-    let area = rect.shrink2(egui::vec2(34.0, 16.0));
+    let area = plot_area(rect);
     let (x0, x1) = if (x_max - x_min).abs() < 1e-12 {
         (x_min - 1.0, x_max + 1.0)
     } else {
@@ -2230,57 +2769,7 @@ fn draw_curve(
         let py = area.bottom() - ((y - y0) / (y1 - y0)) as f32 * area.height();
         egui::pos2(px, py)
     };
-
-    let step_x = nice_step(x1 - x0);
-    let step_y = nice_step(y1 - y0);
-    let grid = Color32::from_rgba_unmultiplied(border().r(), border().g(), border().b(), 140);
-    let mut gx = (x0 / step_x).ceil() * step_x;
-    while gx <= x1 {
-        let px = to_screen(gx, y0).x;
-        painter.line_segment(
-            [egui::pos2(px, area.top()), egui::pos2(px, area.bottom())],
-            Stroke::new(1.0, grid),
-        );
-        painter.text(
-            egui::pos2(px + 2.0, area.bottom() + 2.0),
-            egui::Align2::LEFT_TOP,
-            trim_number(gx),
-            egui::FontId::proportional(8.5),
-            dim(),
-        );
-        gx += step_x;
-    }
-    let mut gy = (y0 / step_y).ceil() * step_y;
-    while gy <= y1 {
-        let py = to_screen(x0, gy).y;
-        painter.line_segment(
-            [egui::pos2(area.left(), py), egui::pos2(area.right(), py)],
-            Stroke::new(1.0, grid),
-        );
-        painter.text(
-            egui::pos2(area.left() - 3.0, py),
-            egui::Align2::RIGHT_CENTER,
-            trim_number(gy),
-            egui::FontId::proportional(8.5),
-            dim(),
-        );
-        gy += step_y;
-    }
-    let axis = Stroke::new(1.2, muted());
-    if x0 <= 0.0 && x1 >= 0.0 {
-        let px = to_screen(0.0, y0).x;
-        painter.line_segment(
-            [egui::pos2(px, area.top()), egui::pos2(px, area.bottom())],
-            axis,
-        );
-    }
-    if y0 <= 0.0 && y1 >= 0.0 {
-        let py = to_screen(x0, 0.0).y;
-        painter.line_segment(
-            [egui::pos2(area.left(), py), egui::pos2(area.right(), py)],
-            axis,
-        );
-    }
+    draw_axes_grid(painter, area, x0, x1, y0, y1);
 
     let stroke = Stroke::new(1.8, accent());
     let y_span = y1 - y0;
@@ -2311,6 +2800,35 @@ fn draw_curve(
     }
     if segment.len() > 1 {
         painter.add(egui::Shape::line(segment, stroke));
+    }
+}
+
+/// 2D 隐函数曲线：线段已经由 marching triangles 给出，直接映射并绘制。
+fn draw_implicit_curve(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    segments: &[[(f64, f64); 2]],
+    x0: f64,
+    x1: f64,
+    y0: f64,
+    y1: f64,
+) {
+    let area = plot_area(rect);
+    draw_axes_grid(painter, area, x0, x1, y0, y1);
+    let to_screen = |x: f64, y: f64| {
+        let px = area.left() + ((x - x0) / (x1 - x0)) as f32 * area.width();
+        let py = area.bottom() - ((y - y0) / (y1 - y0)) as f32 * area.height();
+        egui::pos2(px, py)
+    };
+    let stroke = Stroke::new(1.6, accent());
+    for segment in segments {
+        painter.line_segment(
+            [
+                to_screen(segment[0].0, segment[0].1),
+                to_screen(segment[1].0, segment[1].1),
+            ],
+            stroke,
+        );
     }
 }
 
@@ -2477,6 +2995,106 @@ fn draw_surface(
             (base.g() as f32 * shade) as u8,
             (base.b() as f32 * shade) as u8,
             232,
+        );
+        painter.add(egui::Shape::convex_polygon(
+            positions.to_vec(),
+            color,
+            Stroke::NONE,
+        ));
+    }
+}
+
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn normalize3(value: [f64; 3]) -> [f64; 3] {
+    let length = (value[0] * value[0] + value[1] * value[1] + value[2] * value[2]).sqrt();
+    if length < 1e-12 {
+        [0.0, 0.0, 0.0]
+    } else {
+        [value[0] / length, value[1] / length, value[2] / length]
+    }
+}
+
+/// 3D 隐函数等值面：三角网格按深度排序后填充，用视线空间法线做简单光照。
+#[allow(clippy::too_many_arguments)]
+fn draw_implicit_surface(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    triangles: &[[[f64; 3]; 3]],
+    x0: f64,
+    x1: f64,
+    y0: f64,
+    y1: f64,
+    z0: f64,
+    z1: f64,
+    yaw: f32,
+    pitch: f32,
+) {
+    let cos_yaw = yaw.cos() as f64;
+    let sin_yaw = yaw.sin() as f64;
+    let cos_pitch = pitch.cos() as f64;
+    let sin_pitch = pitch.sin() as f64;
+    let scale = rect.width().min(rect.height()) as f64 * 0.36;
+    let center = rect.center();
+    let project = |point: [f64; 3]| -> (egui::Pos2, f64) {
+        let xn = ((point[0] - x0) / (x1 - x0)) * 2.0 - 1.0;
+        let yn = ((point[1] - y0) / (y1 - y0)) * 2.0 - 1.0;
+        let zn = ((point[2] - z0) / (z1 - z0)) * 2.0 - 1.0;
+        let rx = xn * cos_yaw - yn * sin_yaw;
+        let spin = xn * sin_yaw + yn * cos_yaw;
+        let ry = -(zn * cos_pitch + spin * sin_pitch);
+        let depth = spin * cos_pitch - zn * sin_pitch;
+        (
+            egui::pos2(
+                center.x + (rx * scale) as f32,
+                center.y + (ry * scale) as f32,
+            ),
+            depth,
+        )
+    };
+    let light = normalize3([0.35, -0.35, 0.87]);
+    let mut faces: Vec<(f64, [egui::Pos2; 3], f32, f32)> = Vec::with_capacity(triangles.len());
+    for triangle in triangles {
+        let (p0, d0) = project(triangle[0]);
+        let (p1, d1) = project(triangle[1]);
+        let (p2, d2) = project(triangle[2]);
+        let normal = normalize3(cross3(
+            sub3(triangle[1], triangle[0]),
+            sub3(triangle[2], triangle[0]),
+        ));
+        let spin = normal[0] * sin_yaw + normal[1] * cos_yaw;
+        let ny = -(normal[2] * cos_pitch + spin * sin_pitch);
+        let nx = normal[0] * cos_yaw - normal[1] * sin_yaw;
+        let nz = spin * cos_pitch - normal[2] * sin_pitch;
+        let diffuse = (nx * light[0] + ny * light[1] + nz * light[2]).abs() as f32;
+        let height =
+            ((triangle[0][2] + triangle[1][2] + triangle[2][2]) / 3.0 - z0) / (z1 - z0).max(1e-12);
+        faces.push((
+            (d0 + d1 + d2) / 3.0,
+            [p0, p1, p2],
+            height.clamp(0.0, 1.0) as f32,
+            diffuse,
+        ));
+    }
+    faces.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    for (_, positions, height, diffuse) in faces {
+        let base = lerp_color(accent(), violet(), height * 0.6);
+        let shade = 0.35 + 0.65 * diffuse;
+        let color = Color32::from_rgba_unmultiplied(
+            (base.r() as f32 * shade) as u8,
+            (base.g() as f32 * shade) as u8,
+            (base.b() as f32 * shade) as u8,
+            236,
         );
         painter.add(egui::Shape::convex_polygon(
             positions.to_vec(),
@@ -2877,7 +3495,7 @@ fn help_content(ui: &mut egui::Ui) {
     help_heading(ui, "绘图");
     ui.label(
         RichText::new(
-            "绘图模式重新采样并绘制当前表达式：2D 使用 x，3D 使用 x 与 y。用户函数、变量、分段函数与角度制设置都会生效。",
+            "绘图模式重新采样并绘制当前表达式：2D 绘制 y = f(x)，3D 绘制 z = f(x, y)。3D 中 x、y 是自变量，z 是高度；也可以直接输入 z = ...，绘图会取等号右侧。还可以输入隐方程 F(x, y) = 0 或 F(x, y, z) = 0（例如 x^2 + y^2 + z^2 = 1），此时按零等值面绘制。用户函数、变量、分段函数与角度制设置都会生效。",
         )
         .size(11.0)
         .color(muted()),
@@ -2885,12 +3503,40 @@ fn help_content(ui: &mut egui::Ui) {
     help_table(
         ui,
         &[
-            ("y = sin(x)", "2D 曲线；自动确定 y 范围，也可手动指定"),
-            ("x^2 - y^2", "3D 曲面；鼠标拖动旋转视角"),
-            ("x ∈ [a, b]", "采样区间，3D 时另有 y ∈ [c, d]"),
-            ("采样 / 网格", "2D 采样点数量与 3D 网格密度"),
-            ("线框", "3D 只绘制网格线，不填充曲面"),
-            ("绘制", "按当前参数重新采样；修改参数后需要再次点击"),
+            (
+                "y = sin(x)",
+                "2D 曲线；x 为自变量，y 由表达式决定，自动确定 y 范围",
+            ),
+            (
+                "z = x^2 - y^2",
+                "3D 曲面；x、y 为自变量，z 是高度（也可只写右侧表达式）",
+            ),
+            (
+                "x^2 + y^2 = 1",
+                "2D 隐函数曲线 F(x, y) = 0；圆、椭圆等闭曲线",
+            ),
+            (
+                "x^2 + y^2 + z^2 = 1",
+                "3D 隐函数曲面 F(x, y, z) = 0；球面、锥面等",
+            ),
+            (
+                "自动识别",
+                "输入框下方显示识别结果；含 z 或写成方程时自动按隐函数绘制",
+            ),
+            (
+                "x ∈ [a, b]",
+                "采样区间，3D 时另有 y 区间；隐函数 3D 还有 z 区间",
+            ),
+            ("分辨率", "隐函数的采样网格密度；隐函数 3D 默认 26"),
+            ("自动范围", "隐函数第一次绘制会按曲面自动缩放；也可手动点击"),
+            ("重置", "把 x / y / z 范围恢复为 [-10, 10] 后重新自动适应"),
+            ("采样 / 网格", "显式 2D 采样点数量与显式 3D 网格密度"),
+            ("线框", "显式 3D 只绘制网格线，不填充曲面"),
+            ("绘制", "立即重新采样；修改表达式或范围后也会自动刷新"),
+            (
+                "自动 y 范围",
+                "显式 2D 默认按数据自动缩放；固定范围外的部分会被裁剪并提示",
+            ),
         ],
     );
 
@@ -2921,6 +3567,8 @@ fn help_content(ui: &mut egui::Ui) {
             "solve(sin(x) == 0, x)    # 主值分支",
             "N(pi, 50)                # 50 位圆周率",
             "a = recurring(\"0.1(3)\")  # 2/15",
+            "x^2 + y^2 + z^2 = 1      # 3D 球面（绘图模式）",
+            "x^2 + y^2 = 1            # 2D 圆（绘图模式）",
         ],
     );
 

@@ -172,6 +172,95 @@ fn recurring_decimal_in_session() {
 }
 
 #[test]
+fn implicit_plot_compilation_and_sampling() {
+    use frogcalc_core::plot::{compile_plot, sample_implicit_2d, sample_implicit_3d, PlotKind};
+    let kind = |text: &str, three_d: bool| {
+        compile_plot(text, three_d)
+            .map(|target| target.kind)
+            .expect("compiles")
+    };
+    assert_eq!(kind("sin(x)", false), PlotKind::Explicit2D);
+    assert_eq!(kind("y = x^2", false), PlotKind::Explicit2D);
+    assert_eq!(kind("x^2 + y^2 - 1", false), PlotKind::Implicit2D);
+    assert_eq!(kind("x^2 + y^2 = 1", false), PlotKind::Implicit2D);
+    assert_eq!(kind("x^2 + y^2 + z^2 = 1", true), PlotKind::Implicit3D);
+    assert_eq!(kind("x^2 - y^2", true), PlotKind::Explicit3D);
+    assert_eq!(kind("z = x^2 + y^2", true), PlotKind::Explicit3D);
+    assert_eq!(kind("x^2 + y^2 == 1", true), PlotKind::Implicit3D);
+    assert!(compile_plot("x^2 + z", false).is_err());
+    assert!(compile_plot("x^2 + y^2 = ", true).is_err());
+
+    let mut session = Session::new();
+    let circle = compile_plot("x^2 + y^2 = 1", false).expect("circle");
+    let sampled = sample_implicit_2d(
+        &mut session,
+        &circle.node,
+        "x",
+        "y",
+        -2.0,
+        2.0,
+        -2.0,
+        2.0,
+        60,
+    );
+    assert!(!sampled.segments.is_empty());
+    for segment in &sampled.segments {
+        for (x, y) in segment {
+            let radius = (x * x + y * y).sqrt();
+            assert!((radius - 1.0).abs() < 0.12, "radius = {radius}");
+        }
+    }
+
+    let sphere = compile_plot("x^2 + y^2 + z^2 = 1", true).expect("sphere");
+    let sampled = sample_implicit_3d(
+        &mut session,
+        &sphere.node,
+        "x",
+        "y",
+        "z",
+        -2.0,
+        2.0,
+        -2.0,
+        2.0,
+        -2.0,
+        2.0,
+        14,
+    );
+    assert!(!sampled.triangles.is_empty());
+    for triangle in &sampled.triangles {
+        for point in triangle {
+            let radius = (point[0] * point[0] + point[1] * point[1] + point[2] * point[2]).sqrt();
+            assert!((radius - 1.0).abs() < 0.35, "radius = {radius}");
+        }
+    }
+
+    // 默认范围 [-10,10]^3 也必须能找到球面（自动范围依赖这一点）。
+    let coarse = sample_implicit_3d(
+        &mut session,
+        &sphere.node,
+        "x",
+        "y",
+        "z",
+        -10.0,
+        10.0,
+        -10.0,
+        10.0,
+        -10.0,
+        10.0,
+        26,
+    );
+    assert!(!coarse.triangles.is_empty());
+    let mut max_radius: f64 = 0.0;
+    for triangle in &coarse.triangles {
+        for point in triangle {
+            let radius = (point[0] * point[0] + point[1] * point[1] + point[2] * point[2]).sqrt();
+            max_radius = max_radius.max(radius);
+        }
+    }
+    assert!(max_radius < 1.5, "max radius = {max_radius}");
+}
+
+#[test]
 fn plot_sampling() {
     use frogcalc_core::plot::{sample_2d, sample_surface};
     let mut s = Session::new();

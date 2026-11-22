@@ -232,6 +232,15 @@ impl Session {
         }
     }
 
+    /// 绘图用：把表达式中的用户函数与全局变量展开，得到只含自变量的符号表达式。
+    pub fn compile_plot_expr(&mut self, node: &Node) -> CalcResult<Expr> {
+        self.steps = 0;
+        self.loop_steps = 0;
+        self.call_depth = 0;
+        self.loop_depth = 0;
+        self.eval_node(node, None, 0)
+    }
+
     /// 绘图用：把变量绑定到具体数值后求值，返回实部；非有限值返回 `None`。
     pub fn eval_sample(&mut self, node: &Node, bindings: &[(&str, f64)]) -> Option<f64> {
         let mut frame = HashMap::new();
