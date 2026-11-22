@@ -163,6 +163,32 @@ FrogCalc 使用 Rust 的 `num-bigint` 大整数实现，不自行实现大整数
 
 有理数的 `gcd` 使用欧几里得算法，每次迭代做一次大整数取模；其成本由大整数除法主导。
 
+### 2.6 无限循环小数
+
+代码：`crates/frogcalc-core/src/numeric/recurring.rs`
+
+`recurring("0.1(3)")` 把文本解析为精确分数。设整数部分 `I`、非循环小数位 `N`（`n` 位）、循环节 `R`（`m` 位）：
+
+$$
+x=\operatorname{sign}\left(I+\frac{N}{10^n}+\frac{R}{10^n(10^m-1)}\right)
+$$
+
+实现时统一为单个分数：
+
+$$
+x=\frac{I\cdot 10^n(10^m-1)+N(10^m-1)+R}{10^n(10^m-1)}
+$$
+
+然后交给 `BigRational::new` 约分。`n=0` 对应纯循环小数；没有循环节时 `m=0`，退化为有限小数。`()` 与 `[]` 两种循环节标记都接受，循环节必须写在小数点之后。数字总位数上限 10000；循环节为空、未闭合、循环节后还有数字等非法格式返回带位置的中文错误。
+
+```text
+recurring("0.1(3)")   → 2/15
+recurring("0.(3)")    → 1/3
+recurring("1.2(34)")  → 611/495
+recurring("0.9(9)")   → 1
+recurring("2.5")      → 5/2
+```
+
 ---
 
 ## 3. 精确有理数
@@ -1051,7 +1077,7 @@ ln(exp(x))    → x
 ln(e^x)       → x
 ```
 
-注意：`exp(ln(x)) = x` 依赖 `x > 0`；在没有变量假设系统的情况下，这是按主值恒等式处理的。
+注意：`exp(ln(x)) = x` 依赖 `x > 0`；没有假设时按主值恒等式处理。变量假设（见 10.10）目前不改变这条恒等式的使用，但会影响 `abs`、`sqrt(x^2)` 一类改写。
 
 ### 6.8 化简、展开、因式分解
 
@@ -1106,39 +1132,57 @@ simplify(1/x + 1/y)     → (x+y)/(x*y)
 
 `factor(expr)` 选择次数最高的一元多项式变量，执行：
 
-1. 提取内容（有理系数的最大公因子）；
-2. 用有理根定理找根；
-3. 对每个根 `r`，用 `(x-r)` 反复整除，记录重数；
-4. 剩余二次因子保留（若判别式不是有理平方，不强行拆成实根）；
-5. 重建为乘积。
+1. 提取内容（有理系数的最大公因子），并把剩余部分化成整系数本原多项式；
+2. 用 Yun 平方自由分解把多项式写成 `∏ q_i^i`；
+3. 对每个平方自由部分先提取有理根（一次因子）；
+4. 剩余部分交给 Berlekamp–Zassenhaus：选小素数 `p`、在 `F_p` 上分解、Hensel 提升、枚举模因子子集重组；
+5. 用乘积回代验证，并校正有理常数因子。
 
 例如：
 
 ```text
-factor(x^4-1) → (x^2+1)*(x-1)*(x+1)
+factor(x^4-1)   → (x^2+1)*(x-1)*(x+1)
+factor(x^4+4)   → (x^2-2x+2)*(x^2+2x+2)
 factor(x^2+2x+1) → (x+1)^2
 ```
 
-这是**有理数域上的部分因式分解**，不是完整的 Berlekamp–Zassenhaus 或 Gröbner 基算法。
+一次、二次因子直接给出精确根；更高次不可约因子保持乘积形式。
 
-### 7.9 因式分解的理论背景
+### 7.9 因式分解：Berlekamp–Zassenhaus
 
-代数基本定理说明：任意非常数复系数多项式都能分解为一次因子。但在有理数域 `Q` 上，因子必须是有理系数多项式，情况更复杂：
+代码：`crates/frogcalc-core/src/factor_int.rs`
 
-- 先分离内容（content）与本原部分（primitive part）；
-- 高斯引理保证：整系数本原多项式的有理因式分解可以转化为整数因式分解；
-- 一次因子对应有理根，可用有理根定理找；
-- 二次因子可通过判别式判断是否可约；
-- 更高次不可约因子需要 Berlekamp、Cantor–Zassenhaus 或 Zassenhaus 等算法。
+对整系数本原多项式，若首项系数不是 1，先做变量替换得到首一多项式：
 
-FrogCalc 目前实现的是：
+$$
+g(x)=a_n^{\,n-1}f\!\left(\frac{x}{a_n}\right)
+$$
 
-1. 内容提取；
-2. 有理根；
-3. 二次公式；
-4. 重数统计。
+`g` 是首一整数多项式，分解后再把每个因子 `h(x)` 还原为 `h(a_n x)` 的本原部分。主流程：
 
-因此它能处理大量教学/工程多项式，但不保证把任意有理系数多项式完全分解为不可约因子。
+1. **挑选素数**：`p ∤ a_n`，且 `f mod p` 无平方因子（`gcd(f, f') = 1`）。
+2. **模 `p` 分解**（Berlekamp）：构造矩阵 `Q`，其第 `j` 列为 `x^{pj} mod f` 的系数；求 `Q - I` 在 `F_p` 上的零空间。零空间维数为 1 时 `f mod p` 不可约；否则用基向量 `v` 计算 `gcd(f, v(x)-s)`，`s∈F_p`，递归分裂。
+3. **Hensel 提升**：以 `m=p` 起，把模因子逐位提升到 `m²`。每一步计算
+   $$
+   e=\frac{f-\prod f_i}{m}\pmod m,\qquad
+   A_i=\prod_{j\ne i} f_j \pmod m
+   $$
+   解线性同余方程组
+   $$
+   \sum_i h_i A_i \equiv e \pmod m
+   $$
+   （未知量为各因子的修正系数，矩阵在 `Z/m` 上可逆），令 `f_i ← f_i + m h_i`，模数平方后继续。
+4. **重组（Zassenhaus）**：模数超过 `2B` 后，把系数对称化到 `(-m/2, m/2]`，按子集大小递增枚举模因子乘积，用首一整除检验得到真因子；找到后约去并继续。
+5. **验证**：所有因子乘积必须与目标多项式只相差有理常数，否则回退到旧路径。
+
+界 `B` 使用 Mignotte 估计：
+
+$$
+B=2^n\left\lceil\sqrt{n+1}\right\rceil\max_i|a_i|+1
+$$
+
+默认对次数 ≤ 28、系数位数 ≤ 4096 的多项式启用该算法；超过上限时退回“有理根 + 二次公式 + Durand–Kerner 数值根”。
+
 
 ---
 
@@ -1265,10 +1309,10 @@ $$
 1. 一次：直接移项；
 2. 二次：公式；
 3. 三次及以上：
-   - 先找有理根；
-   - 用 `(x-r)` 整除，降次；
-   - 剩余二次：公式；
-   - 剩余三次及以上：数值求根。
+   - 先做因式分解（平方自由分解 + 有理根 + Berlekamp–Zassenhaus）；
+   - 一次因子：精确有理根；
+   - 二次因子：二次公式（可能得到根式或复数）；
+   - 剩余更高次因子：Durand–Kerner 数值求根。
 
 ### 7.7 Durand–Kerner 数值求根
 
@@ -1312,21 +1356,27 @@ $$
 R(x)=Q(x)+\frac{r(x)}{D(x)}
 $$
 
-2. 对真分式 `r/D`，把 `D` 分解为互不相同的线性/二次因子；
+2. 对真分式 `r/D`，用 Yun 算法把分母分解为平方自由部分：
+
+$$
+D(x)=\prod_i q_i(x)^i
+$$
+
 3. 设：
 
 $$
 \frac{r(x)}{D(x)}
 =
-\sum_i \frac{N_i(x)}{D_i(x)}
+\sum_i \sum_{j=1}^{i} \frac{A_{i,j}(x)}{q_i(x)^j},
+\qquad \deg A_{i,j}<\deg q_i
 $$
 
-其中 `deg N_i < deg D_i`；
-4. 两边乘以 `D(x)`，比较各次幂系数；
-5. 得到有理数线性方程组；
-6. 用高斯-约当消元求解。
+4. 两侧乘以 `D(x)`，比较各次幂系数，得到 `deg D` 阶有理数线性方程组；
+5. 用高斯-约当消元求解；
+6. 逐项积分（见 8.3）。
 
-当前只处理**互不相同**（重数均为 1）的因子；遇到重因子会返回未求值形式。
+重因子不再直接放弃：线性因子与二次因子的任意重数都可以通过递推公式积分；三次及以上的不可约因子仍返回未求值形式。
+
 
 ---
 
@@ -1443,6 +1493,23 @@ $$
 \int \frac{dx}{a^2+x^2}=\frac{1}{a}\arctan\frac{x}{a}
 $$
 
+10. 对数导数：枚举子表达式 `u`，若
+
+$$
+f(x)=c\,\frac{u'(x)}{u(x)}
+$$
+
+且 `c` 不含积分变量，则原函数为 `c ln|u(x)|`。这覆盖 `1/(x ln x)`、`x/(x^2+1)`、`1/(x(x+1))` 等常见形式。
+
+11. 根式形式：
+
+```text
+∫ dx/√(c-x²)      → asin(x/√c)
+∫ √(c-x²) dx      → x√(c-x²)/2 + (c/2) asin(x/√c)
+∫ dx/√(x²+c)      → ln|x+√(x²+c)|
+∫ √(x²+c) dx      → x√(x²+c)/2 + (c/2) ln|x+√(x²+c)|
+```
+
 ### 8.3 有理函数积分
 
 对：
@@ -1482,6 +1549,46 @@ $$
 \frac{2}{\sqrt{\Delta}}
 \arctan\frac{2ax+b}{\sqrt{\Delta}}
 $$
+
+当判别式 `Δ` 为负（因子在实数上可约但在有理数域上不可约）时，改用对数形式：
+
+$$
+\int \frac{dx}{q}
+=
+\frac{1}{\sqrt{-\Delta}}
+\ln\left|
+\frac{2x+b-\sqrt{-\Delta}}{2x+b+\sqrt{-\Delta}}
+\right|
+$$
+
+重因子：
+
+$$
+\int \frac{dx}{(ax+b)^j}
+=
+\frac{(ax+b)^{1-j}}{a(1-j)}
+$$
+
+对二次因子 `q=x^2+bx+c` 的 `j` 次幂，先将分子写成 `αq'(x)+β`：
+
+$$
+\int \frac{\alpha q'}{q^j}
+=
+\frac{\alpha}{(1-j)q^{j-1}}
+$$
+
+剩余常数项用递推（`Δ=4c-b²`，`j>1`）：
+
+$$
+\int \frac{dx}{q^j}
+=
+\frac{2x+b}{(j-1)\Delta q^{j-1}}
++
+\frac{2(2j-3)}{(j-1)\Delta}
+\int \frac{dx}{q^{j-1}}
+$$
+
+基线情形 `j=1` 见上式。三次及以上的不可约因子需要代数扩域上的对数，当前保留未求值形式。
 
 ### 8.4 定积分
 
@@ -1525,15 +1632,16 @@ integrate(表达式, 变量)
 
 “初等函数”指由有理函数、指数、对数、三角函数及其反函数经过有限次四则运算与复合得到的函数。Liouville 定理给出了初等原函数存在的必要条件；Risch 算法则提供了判定初等可积性并构造原函数的系统方法（包括超越情形与代数情形）。
 
-FrogCalc 没有实现 Risch 算法，而是使用：
+FrogCalc 没有实现完整的 Risch 算法，而是使用：
 
 - 基本积分表；
 - 线性换元；
 - 分部积分；
-- 有理函数部分分式；
-- 模式匹配换元。
+- 对数导数模式匹配；
+- 含重根的有理函数部分分式与二次因子递推；
+- 常见根式积分表。
 
-这覆盖常见形式，但不是可积性判定器。一个积分返回未求值，只表示“当前规则没有匹配到”，不表示它一定没有初等原函数。
+这覆盖常见形式，但不是可积性判定器。一个积分返回未求值，只表示“当前规则没有匹配到”，不表示它一定没有初等原函数。真正实现 Risch–Liouville 判定需要微分域、代数扩域与结构定理，属于后续路线。
 
 ### 8.6 极限与级数
 
@@ -1564,7 +1672,7 @@ FrogCalc 没有实现 Risch 算法，而是使用：
 见第 7 节：
 
 - 一次/二次：精确；
-- 高次：有理根 + 降次 + 数值根。
+- 高次：因式分解后，一次/二次因子精确求解，更高次因子数值求根。
 
 ### 9.3 逆运算路径
 
@@ -1725,7 +1833,47 @@ for x in {1, 2, 3} { ... }
 - 语句块函数调用时压入一个局部作用域，参数与函数内赋值都写入该作用域；变量查找从内到外，最后落到全局变量表，因此函数内赋值不会污染全局。
 - 支持递归调用，复用既有的 200 层调用深度保护；函数内部暂不允许再定义函数。
 - `range(a, b[, step])` 生成包含终点的整数列表；`for` 也可以直接遍历列表。
+- 循环体内可以使用 `break` 结束最内层循环、`continue` 跳过本次迭代的剩余语句。`break/continue` 只能出现在循环内，且不能跨越函数边界（函数体执行时循环深度重置为 0）。
 - 迭代总次数上限 100000；求值步骤上限仍为 500000。
+
+分段函数 `piecewise(c1, v1[, c2, v2 ...][, 默认值])` 作为特殊形式求值：
+
+- 依次求值条件，真值判定与 `if` 一致；
+- 第一个为真的条件对应的值被返回，其余分支不参与求值（惰性）；
+- 所有条件都确定为假且有默认值时返回默认值；没有默认值时报错；
+- 条件含未定义符号而无法判定时，保留 `piecewise(...)` 形式，便于显示与后续代入；
+- 求导逐段进行，条件保持不变。
+
+### 10.10 变量假设
+
+`assume(x > 0)` 记录变量的符号性质，内部为每个变量保存：
+
+```text
+Fact {
+  sign: Positive | Negative | Zero | NonNegative | NonPositive | Unknown
+  nonzero: bool
+}
+```
+
+符号性质通过结构分析传播：
+
+- 数字、`pi`、`e` 直接已知；
+- 乘法的符号等于各因子符号的乘积；
+- 偶次整数幂非负，正底数的任意实幂为正；
+- 和式只有在所有项同号时才给出符号；
+- `abs`/`sqrt` 非负，`exp`、`cosh` 为正。
+
+由假设驱动的改写（`symbolic/assume.rs`）：
+
+```text
+abs(u)       → u      （u ≥ 0）
+abs(u)       → -u     （u ≤ 0）
+sign(u)      → 1 / -1 / 0（符号已知时）
+(u^(2m))^p   → |u|^(2mp)（指数为整数时）
+```
+
+改写只作用于结果展示与显式的 `simplify/expand/factor`，不会修改工作区中保存的原始表达式；假设本身随工作区序列化（`assume(x > 0)` 行）。
+
 
 ### 10.7 求值环境
 
@@ -1815,7 +1963,7 @@ asin(1/2)   → 30
 - 没有严格的误差上界；
 - 没有“最后一位正确”保证；
 - 没有自适应精度重算；
-- 没有变量假设（正数/实数）系统。
+- 变量假设只记录符号性质，不参与近似计算的条件分支判定。
 
 因此文档与 UI 都只声称“高精度近似”，不声称“精确到每一位”。
 
@@ -1890,6 +2038,8 @@ FrogCalc 不自研大整数乘法/除法算法，直接使用 Rust 的 `num-bigi
 | 求值 | `O(n)` |
 | 有理根 | 因子枚举 + Horner |
 | Durand–Kerner | `O(iterations · n²)` |
+| Berlekamp 模分解 | `O(n³)`（`F_p` 上的零空间） |
+| Hensel 提升 | 每轮 `O(n³)` 大整数运算，轮数约为系数位数的对数 |
 
 ### 12.3 BigFloat
 
@@ -1909,13 +2059,29 @@ FrogCalc 不自研大整数乘法/除法算法，直接使用 Rust 的 `num-bigi
 - 积分/求导采用递归规则，受深度上限保护；
 - 解方程的逆运算采用单变量出现一次的保守策略。
 
+### 12.5 绘图采样
+
+代码：`crates/frogcalc-core/src/plot.rs`（采样）与 `crates/frogcalc-app/src/main.rs`（渲染）。
+
+- 2D：在 `[x_min, x_max]` 上等距采样（16–4000 点），每点把 `x` 绑定为 `BigFloat` 后走正常求值流程，再经 `to_cnum` 转为 `f64`；非有限值或求值错误记为“无定义”，渲染时断开。
+- 3D：在 `x × y` 网格上采样（8–80 边），得到高度场。
+- 自动范围：2D 的 y 范围、3D 的 z 范围取有限采样值的最小/最大并留 5–8% 余量；固定范围外由裁剪区处理。
+- 相邻点跳变超过两倍 y 跨度时断线，用于避免把渐近线连成竖线。
+- 3D 投影：先用偏航角旋转，再按俯仰角压缩，屏幕坐标
+
+$$
+s_x = x\cos\alpha - y\sin\alpha,\qquad
+s_y = (x\sin\alpha + y\cos\alpha)\sin\beta - z\cos\beta
+$$
+
+  每个网格四边形按平均视线深度从远到近绘制（画家算法），颜色按高度在强调色与紫色之间插值；线框模式只画网格线。
+- 采样复用会话求值，因此用户函数、变量、分段函数与角度制都生效；采样期间不写入历史与 `ans`。
+
 ---
 
 ## 13. 测试与验证
 
-当前测试位于 `crates/frogcalc-core/tests/`，共 16 个用例，覆盖：
-
-### 精确算术
+当前测试位于 `crates/frogcalc-core/tests/`，共 27 个用例，覆盖：### 精确算术
 
 - 分数精确加减乘；
 - 小数精确存储与显示；
@@ -1954,7 +2120,18 @@ FrogCalc 不自研大整数乘法/除法算法，直接使用 Rust 的 `num-bigi
 - `while` 与循环上限；
 - `for` + `range` / 列表遍历；
 - 比较、`and` / `or` / `not`；
-- 多语句函数、局部作用域、递归、循环变量作用域与函数体条件序列化。
+- 多语句函数、局部作用域、递归、循环变量作用域与函数体条件序列化；
+- `break` / `continue` 与循环上限。
+
+### 新增能力
+
+- Berlekamp–Zassenhaus 因式分解与重根展开验证；
+- 含重根/不可约二次因子的有理函数积分（对结果求导做数值回代）；
+- 分段函数求值、求导与显示；
+- 变量假设驱动的 `abs` / `sqrt(x^2)` 化简与工作区往返；
+- 无限循环小数的精确解析、工作区往返与错误格式；
+- 2D/3D 采样、无定义点过滤与用户函数采样。
+
 
 ### 健壮性
 
@@ -1978,21 +2155,24 @@ FrogCalc 不自研大整数乘法/除法算法，直接使用 Rust 的 `num-bigi
 | 文件 | 职责 |
 | --- | --- |
 | `crates/frogcalc-core/src/numeric/mod.rs` | BigInt 有理数、gcd、精确幂、十进制解析、显示 |
+| `crates/frogcalc-core/src/numeric/recurring.rs` | 无限循环小数文本 → 精确分数 |
 | `crates/frogcalc-core/src/numeric/bigfloat.rs` | BigFloat 表示、四则、sqrt/exp/ln/π/三角/反三角/双曲 |
 | `crates/frogcalc-core/src/parser/lexer.rs` | 词法分析、位置追踪、注释/字符串 |
 | `crates/frogcalc-core/src/parser/parser.rs` | Pratt 解析、语句、函数定义、列表、多行 |
 | `crates/frogcalc-core/src/parser/ast.rs` | AST 类型定义 |
 | `crates/frogcalc-core/src/symbolic/expr.rs` | 表达式树、自动化简、根式、精确三角、内置函数 |
 | `crates/frogcalc-core/src/symbolic/expr.rs` | 精确复数识别与运算 |
-| `crates/frogcalc-core/src/symbolic/transform.rs` | 展开、通分、约分、因式分解 |
-| `crates/frogcalc-core/src/symbolic/expr.rs` | occurs、替换、节点计数、常量判断 |
-| `crates/frogcalc-core/src/polynomial.rs` | 多项式运算、GCD、有理根、二次公式、Durand–Kerner |
-| `crates/frogcalc-core/src/calculus/diff.rs` | 求导规则 |
-| `crates/frogcalc-core/src/calculus/integrate.rs` | 积分规则、部分分式、定积分、Simpson |
+| `crates/frogcalc-core/src/symbolic/transform.rs` | 展开、通分、约分、因式分解入口 |
+| `crates/frogcalc-core/src/symbolic/assume.rs` | 变量假设、符号分析、假设驱动的改写 |
+| `crates/frogcalc-core/src/symbolic/format_expr.rs` | 纯文本、Unicode 与 LaTeX 序列化 |
+| `crates/frogcalc-core/src/factor_int.rs` | 模 p Berlekamp、Hensel 提升、Zassenhaus 重组 |
+| `crates/frogcalc-core/src/polynomial.rs` | 多项式运算、GCD、平方自由分解、有理根、二次公式、Durand–Kerner |
+| `crates/frogcalc-core/src/calculus/diff.rs` | 求导规则（含分段函数） |
+| `crates/frogcalc-core/src/calculus/integrate.rs` | 积分规则、含重根部分分式、对数导数、定积分、Simpson |
 | `crates/frogcalc-core/src/solve.rs` | 方程求解、逆运算 |
-| `crates/frogcalc-core/src/eval/approx.rs` | 表达式近似、复数近似、格式 |
-| `crates/frogcalc-core/src/eval/session.rs` | 解释执行、变量/函数、设置、结果格式化、限制 |
-| `crates/frogcalc-core/src/symbolic/format_expr.rs` | 纯文本与 LaTeX 序列化 |
+| `crates/frogcalc-core/src/plot.rs` | 2D 曲线 / 3D 曲面采样 |
+| `crates/frogcalc-core/src/eval/approx.rs` | 表达式近似、复数近似、条件与分段函数近似 |
+| `crates/frogcalc-core/src/eval/session.rs` | 解释执行、变量/函数/假设、绘图采样、设置、结果格式化、限制 |
 | `crates/frogcalc-core/src/lib.rs` | 对外 API |
 
 ---
@@ -2001,11 +2181,10 @@ FrogCalc 不自研大整数乘法/除法算法，直接使用 Rust 的 `num-bigi
 
 ### 符号与代数
 
-- 完整 Risch 积分算法；
-- 重因子部分分式；
-- 完整 Berlekamp–Zassenhaus 因式分解；
+- 完整 Risch–Liouville 判定与代数扩域上的积分；
+- 三次及以上不可约因子的解析积分；
 - Gröbner 基与多元多项式；
-- 变量假设系统（正数、实数、整数）；
+- 整数/有理数之外的假设（实数、整数、奇偶性）对化简的进一步影响；
 - 三角恒等式库与更激进化简；
 - 极限、泰勒/麦克劳林级数；
 - 符号求和/求积；
@@ -2021,9 +2200,10 @@ FrogCalc 不自研大整数乘法/除法算法，直接使用 Rust 的 `num-bigi
 
 ### 工程
 
-- 计算内核迁移到 Web Worker / 子进程；
-- 矩阵、线性代数、绘图；
-- 脚本文件导入/导出、break/continue、函数内嵌套定义函数；
+- 计算内核迁移到后台线程 / 任务队列；
+- 矩阵、线性代数；
+- 参数曲线、隐函数绘图与多曲线对比；
+- 函数内嵌套定义函数；
 - 撤销/重做、导入导出更多格式；
 - 自动更新与代码签名；
 - macOS / Linux 打包。
@@ -2040,13 +2220,19 @@ FrogCalc 不自研大整数乘法/除法算法，直接使用 Rust 的 `num-bigi
 复数近似     → BigFloat 实虚部
 根式         → sqrt(n) 保持为 n^(1/2)
 根式化简     → 提取 q 次幂因子 + p=kq+r
+循环小数     → recurring("0.1(3)")，I + N/10^n + R/(10^n(10^m-1))
 三角函数精确 → π 系数 × 12 为整数时查 15° 表
 多项式       → 升幂系数数组，有理系数
 多项式 GCD   → 欧几里得 + 首一化
-高次求根     → 有理根降次 + Durand–Kerner
-积分         → 表 + 线性换元 + 有理函数 + 分部 + 换元
+因式分解     → 平方自由分解 + 有理根 + Berlekamp–Zassenhaus
+高次求根     → 因式分解后一次/二次精确，其余 Durand–Kerner
+积分         → 表 + 线性换元 + 有理函数(含重根) + 分部 + 对数导数
 定积分       → F(b)-F(a)，失败则自适应 Simpson
 方程         → 多项式优先，其次单次出现逆运算
+变量假设     → assume(x > 0)，驱动 abs / 根式化简
+分段函数     → piecewise(条件, 值, ..., 默认)，惰性求值
+控制流       → if / while / for，支持 break / continue
+绘图         → 2D 采样折线、3D 高度场 + 画家算法
 解释器       → Lexer + Pratt + AST + 环境求值
 精度         → 保护位 + 级数终止 + 无严格误差界
 ```

@@ -2,8 +2,8 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use crate::numeric::{rat, rat_to_f64, BigFloat, Rat};
 use crate::polynomial::{
-    factor_poly, poly_degree, poly_div_mod, poly_from_expr, poly_is_zero, poly_major_coeff,
-    poly_monic, poly_mul, poly_scale, poly_to_expr, Poly,
+    poly_degree, poly_div_mod, poly_from_expr, poly_is_zero, poly_major_coeff, poly_monic,
+    poly_mul, poly_pow, poly_scale, poly_to_expr, squarefree_parts, Poly,
 };
 use crate::symbolic::transform::{simplify, to_fraction};
 use crate::symbolic::{
@@ -111,6 +111,9 @@ fn integrate_mul(factors: &[Expr], var: &str, depth: usize) -> Expr {
     if let Some(result) = try_by_parts(&expr, var, depth) {
         return result;
     }
+    if let Some(result) = try_log_derivative(&expr, var, depth) {
+        return result;
+    }
     unevaluated(&expr, var)
 }
 
@@ -171,13 +174,46 @@ fn integrate_pow(base: &Expr, exp: &Expr, var: &str, depth: usize) -> Expr {
                 }
             }
         }
-        if n == &rat(-1, 2) {
+        if n == &rat(-1, 2) || n == &rat(1, 2) {
             if let Some(p) = poly_from_expr(base, var) {
                 if poly_degree(&p) == Some(2) && p.coeffs[1].is_zero() {
                     let c = &p.coeffs[0];
                     let a = &p.coeffs[2];
-                    if a == &rat(-1, 1) && c.is_one() {
-                        return call_expr("asin", vec![x]);
+                    if a == &rat(-1, 1) && c.is_positive() {
+                        let sqrt_c = pow(num(c.clone()), num(rat(1, 2)));
+                        if n == &rat(-1, 2) {
+                            return call_expr("asin", vec![div(x.clone(), sqrt_c)]);
+                        }
+                        return add(vec![
+                            div(
+                                mul(vec![x.clone(), pow(base.clone(), num(rat(1, 2)))]),
+                                integer(2),
+                            ),
+                            div(
+                                mul(vec![
+                                    num(c.clone()),
+                                    call_expr("asin", vec![div(x, sqrt_c)]),
+                                ]),
+                                integer(2),
+                            ),
+                        ]);
+                    }
+                    if a.is_one() && c.is_positive() {
+                        let sqrt_base = pow(base.clone(), num(rat(1, 2)));
+                        let log = call_expr(
+                            "ln",
+                            vec![call_expr(
+                                "abs",
+                                vec![add(vec![x.clone(), sqrt_base.clone()])],
+                            )],
+                        );
+                        if n == &rat(-1, 2) {
+                            return log;
+                        }
+                        return add(vec![
+                            div(mul(vec![x, sqrt_base]), integer(2)),
+                            div(mul(vec![num(c.clone()), log]), integer(2)),
+                        ]);
                     }
                 }
             }
@@ -193,6 +229,9 @@ fn integrate_pow(base: &Expr, exp: &Expr, var: &str, depth: usize) -> Expr {
                 return div(outer, num(linear.coeffs[1].clone()));
             }
         }
+    }
+    if let Some(result) = try_log_derivative(&expr, var, depth) {
+        return result;
     }
     unevaluated(&expr, var)
 }
@@ -219,6 +258,9 @@ fn integrate_call(name: &str, args: &[Expr], var: &str, depth: usize) -> Expr {
             mul(vec![arg.clone(), call_expr("abs", vec![arg.clone()])]),
             num(a * rat(2, 1)),
         );
+    }
+    if let Some(result) = try_log_derivative(&expr, var, depth) {
+        return result;
     }
     let _ = depth;
     unevaluated(&expr, var)
@@ -358,6 +400,59 @@ fn try_by_parts(expr: &Expr, var: &str, depth: usize) -> Option<Expr> {
     None
 }
 
+fn try_log_derivative(expr: &Expr, var: &str, depth: usize) -> Option<Expr> {
+    if depth > MAX_DEPTH - 4 {
+        return None;
+    }
+    let mut candidates: Vec<Expr> = Vec::new();
+    fn collect(expr: &Expr, var: &str, out: &mut Vec<Expr>) {
+        match expr {
+            Expr::Mul(factors) => {
+                for factor in factors {
+                    collect(factor, var, out);
+                    out.push(factor.clone());
+                }
+            }
+            Expr::Pow(base, _) => {
+                collect(base, var, out);
+                out.push((**base).clone());
+            }
+            Expr::Call(_, args) => {
+                for arg in args {
+                    collect(arg, var, out);
+                    out.push(arg.clone());
+                }
+            }
+            Expr::Add(terms) => {
+                for term in terms {
+                    collect(term, var, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    collect(expr, var, &mut candidates);
+    for candidate in candidates {
+        if !occurs(&candidate, var) {
+            continue;
+        }
+        let Ok(derivative) = diff(&candidate, var, 1) else {
+            continue;
+        };
+        if matches!(&derivative, Expr::Num(value) if value.is_zero()) {
+            continue;
+        }
+        let quotient = simplify(&div(mul(vec![expr.clone(), candidate.clone()]), derivative));
+        if !occurs(&quotient, var) {
+            return Some(mul(vec![
+                quotient,
+                call_expr("ln", vec![call_expr("abs", vec![candidate])]),
+            ]));
+        }
+    }
+    None
+}
+
 fn try_rational(expr: &Expr, var: &str, _depth: usize) -> Option<Expr> {
     let parts = to_fraction(expr);
     let pn = poly_from_expr(&parts.n, var)?;
@@ -401,37 +496,45 @@ fn integrate_poly(poly: &Poly, var: &str) -> Expr {
 }
 
 fn integrate_proper_fraction(numerator: &Poly, denominator: &Poly, var: &str) -> Option<Expr> {
-    let monic = poly_monic(denominator);
     let leading = poly_major_coeff(denominator)?;
+    let monic = poly_monic(denominator);
     let scaled = poly_scale(numerator, &leading.recip());
-    let factored = factor_poly(&monic).ok()?;
-    if factored.factors.is_empty() || factored.factors.iter().any(|(_, m)| *m > 1) {
+    let total = poly_degree(&monic)?;
+    let parts = squarefree_parts(&monic);
+    if parts.is_empty() {
         return None;
     }
-    let total = poly_degree(&monic)?;
     #[derive(Clone)]
     struct Column {
-        factor: Poly,
+        part: usize,
         power: usize,
+        shift: usize,
         poly: Poly,
     }
-    let mut columns = Vec::new();
-    for (factor, _) in &factored.factors {
-        let degree = poly_degree(factor)?;
-        let quotient = poly_div_mod(&monic, factor).ok()?.0;
-        for j in 0..degree {
-            let mut coeffs = vec![Rat::zero(); j];
-            coeffs.push(Rat::one());
-            let monomial = Poly {
-                var: monic.var.clone(),
-                coeffs,
-            };
-            let poly = poly_mul(&monomial, &quotient).ok()?;
-            columns.push(Column {
-                factor: factor.clone(),
-                power: j,
-                poly,
-            });
+    let mut columns: Vec<Column> = Vec::new();
+    for (part_index, (part, multiplicity)) in parts.iter().enumerate() {
+        let degree = poly_degree(part)?;
+        for power in 1..=*multiplicity as usize {
+            let powered = poly_pow(part, power as u32).ok()?;
+            let (cofactor, remainder) = poly_div_mod(&monic, &powered).ok()?;
+            if !poly_is_zero(&remainder) {
+                return None;
+            }
+            for shift in 0..degree {
+                let mut coeffs = vec![Rat::zero(); shift];
+                coeffs.push(Rat::one());
+                let monomial = Poly {
+                    var: monic.var.clone(),
+                    coeffs,
+                };
+                let poly = poly_mul(&monomial, &cofactor).ok()?;
+                columns.push(Column {
+                    part: part_index,
+                    power,
+                    shift,
+                    poly,
+                });
+            }
         }
     }
     if columns.len() != total {
@@ -450,18 +553,25 @@ fn integrate_proper_fraction(numerator: &Poly, denominator: &Poly, var: &str) ->
     }
     let solution = solve_linear_system(matrix, rhs)?;
     let mut terms = Vec::new();
-    for (factor, _) in &factored.factors {
-        let degree = poly_degree(factor)?;
-        let mut numerator_coeffs = vec![Rat::zero(); degree];
-        for j in 0..degree {
-            let index = columns.iter().position(|c| {
-                c.power == j && equals(&poly_to_expr(&c.factor), &poly_to_expr(factor))
-            });
-            if let Some(index) = index {
-                numerator_coeffs[j] = solution[index].clone();
+    for (part_index, (part, multiplicity)) in parts.iter().enumerate() {
+        let degree = poly_degree(part)?;
+        for power in 1..=*multiplicity as usize {
+            let mut numerator_coeffs = vec![Rat::zero(); degree];
+            for (index, column) in columns.iter().enumerate() {
+                if column.part == part_index && column.power == power {
+                    numerator_coeffs[column.shift] = solution[index].clone();
+                }
             }
+            if numerator_coeffs.iter().all(|c| c.is_zero()) {
+                continue;
+            }
+            terms.push(integrate_repeated_factor(
+                part,
+                &numerator_coeffs,
+                power,
+                var,
+            )?);
         }
-        terms.push(integrate_factor_fraction(factor, &numerator_coeffs, var)?);
     }
     Some(add(terms))
 }
@@ -507,53 +617,118 @@ fn solve_linear_system(mut a: Vec<Vec<Rat>>, b: Vec<Rat>) -> Option<Vec<Rat>> {
     Some(a.into_iter().map(|row| row[n].clone()).collect())
 }
 
-fn integrate_factor_fraction(factor: &Poly, numerator: &[Rat], var: &str) -> Option<Expr> {
-    let degree = poly_degree(factor)?;
-    let x = x_of(var);
-    let factor_expr = poly_to_expr(factor);
-    if degree == 1 {
-        let a = &factor.coeffs[1];
-        let coefficient = numerator.first().cloned().unwrap_or_else(Rat::zero);
-        if coefficient.is_zero() {
-            return Some(zero());
+/// 积分 `(分子) / (q^power)`，其中 `q` 是 square-free 的 monic 因子。
+fn integrate_repeated_factor(q: &Poly, numerator: &[Rat], power: usize, var: &str) -> Option<Expr> {
+    let degree = poly_degree(q)?;
+    let q_expr = poly_to_expr(q);
+    match degree {
+        1 => {
+            let ratio = q.coeffs.get(1)?;
+            let coefficient = numerator.first().cloned().unwrap_or_else(Rat::zero) / ratio;
+            if coefficient.is_zero() {
+                return Some(zero());
+            }
+            if power == 1 {
+                return Some(mul(vec![
+                    num(coefficient),
+                    call_expr("ln", vec![call_expr("abs", vec![q_expr])]),
+                ]));
+            }
+            let exponent = 1 - power as i64;
+            Some(div(
+                mul(vec![num(coefficient), pow(q_expr, integer(exponent))]),
+                integer(exponent),
+            ))
         }
-        return Some(mul(vec![
-            num(coefficient / a),
-            call_expr("ln", vec![call_expr("abs", vec![factor_expr])]),
-        ]));
+        2 => {
+            let a = &q.coeffs[2];
+            let b = &q.coeffs[1];
+            let c = &q.coeffs[0];
+            let linear = numerator.get(1).cloned().unwrap_or_else(Rat::zero);
+            let constant = numerator.first().cloned().unwrap_or_else(Rat::zero);
+            let alpha = linear.clone() / (a * rat(2, 1));
+            let beta = constant - &linear * b / (a * rat(2, 1));
+            let mut terms = Vec::new();
+            if !alpha.is_zero() {
+                if power == 1 {
+                    terms.push(mul(vec![
+                        num(alpha),
+                        call_expr("ln", vec![call_expr("abs", vec![q_expr.clone()])]),
+                    ]));
+                } else {
+                    let exponent = 1 - power as i64;
+                    terms.push(div(
+                        mul(vec![num(alpha), pow(q_expr.clone(), integer(exponent))]),
+                        integer(exponent),
+                    ));
+                }
+            }
+            if !beta.is_zero() {
+                let integral = integrate_quadratic_power(a, b, c, power, var)?;
+                terms.push(mul(vec![num(beta), integral]));
+            }
+            Some(add(terms))
+        }
+        _ => None,
     }
-    if degree == 2 {
-        let a = &factor.coeffs[2];
-        let b = &factor.coeffs[1];
-        let c = &factor.coeffs[0];
-        let coeff_a = numerator.get(1).cloned().unwrap_or_else(Rat::zero);
-        let coeff_b = numerator.first().cloned().unwrap_or_else(Rat::zero);
-        let disc = a * c * rat(4, 1) - b * b;
-        if !disc.is_positive() {
+}
+
+/// ∫ dx / (a x^2 + b x + c)^power，`a` 非零、判别式不为零。
+fn integrate_quadratic_power(a: &Rat, b: &Rat, c: &Rat, power: usize, var: &str) -> Option<Expr> {
+    let x = x_of(var);
+    let q_expr = poly_to_expr(&Poly {
+        var: var.to_string(),
+        coeffs: vec![c.clone(), b.clone(), a.clone()],
+    });
+    let delta = a * c * rat(4, 1) - b * b;
+    if delta.is_zero() || power == 0 || !a.is_one() {
+        return None;
+    }
+    if power == 1 {
+        // 先化成首一形式，再套用标准公式。
+        let bm = b / a;
+        let cm = c / a;
+        let delta_m = cm * rat(4, 1) - &bm * &bm;
+        if delta_m.is_zero() {
             return None;
         }
+        if delta_m.is_positive() {
+            let sqrt_delta = pow(num(delta_m), num(rat(1, 2)));
+            return Some(mul(vec![
+                div(integer(2), sqrt_delta.clone()),
+                call_expr(
+                    "atan",
+                    vec![div(
+                        add(vec![mul(vec![integer(2), x]), num(bm)]),
+                        sqrt_delta,
+                    )],
+                ),
+            ]));
+        }
+        let disc = -delta_m;
         let sqrt_disc = pow(num(disc), num(rat(1, 2)));
-        let mut terms = Vec::new();
-        if !coeff_a.is_zero() {
-            terms.push(mul(vec![
-                num(coeff_a.clone() / (a * rat(2, 1))),
-                call_expr("ln", vec![call_expr("abs", vec![factor_expr.clone()])]),
-            ]));
-        }
-        let rem = coeff_b - coeff_a * b / (a * rat(2, 1));
-        if !rem.is_zero() {
-            let atan_arg = div(
-                add(vec![mul(vec![num(a * rat(2, 1)), x]), num(b.clone())]),
-                sqrt_disc.clone(),
-            );
-            terms.push(mul(vec![
-                div(num(rem * rat(2, 1)), sqrt_disc),
-                call_expr("atan", vec![atan_arg]),
-            ]));
-        }
-        return Some(add(terms));
+        let linear = add(vec![mul(vec![integer(2), x]), num(bm)]);
+        let ratio = div(
+            sub(linear.clone(), sqrt_disc.clone()),
+            add(vec![linear, sqrt_disc.clone()]),
+        );
+        return Some(div(
+            call_expr("ln", vec![call_expr("abs", vec![ratio])]),
+            sqrt_disc,
+        ));
     }
-    None
+    let j = power as i64;
+    let previous = integrate_quadratic_power(a, b, c, power - 1, var)?;
+    let first = div(
+        add(vec![mul(vec![integer(2), x]), num(b.clone())]),
+        mul(vec![
+            integer(j - 1),
+            num(delta.clone()),
+            pow(q_expr, integer(j - 1)),
+        ]),
+    );
+    let factor = div(num(rat(2 * (2 * j - 3), j - 1)), num(delta));
+    Some(add(vec![first, mul(vec![factor, previous])]))
 }
 
 // ---------------------------------------------------------------------------

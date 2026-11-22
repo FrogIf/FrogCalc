@@ -56,6 +56,16 @@ impl Parser {
                 "if" => return self.parse_if(),
                 "while" => return self.parse_while(),
                 "for" => return self.parse_for(),
+                "break" => {
+                    let pos = first.pos;
+                    self.index += 1;
+                    return Ok(Statement::Break { pos });
+                }
+                "continue" => {
+                    let pos = first.pos;
+                    self.index += 1;
+                    return Ok(Statement::Continue { pos });
+                }
                 _ => {}
             }
             if let Some(Token {
@@ -503,7 +513,7 @@ impl Parser {
 fn is_keyword(name: &str) -> bool {
     matches!(
         name,
-        "if" | "else" | "while" | "for" | "in" | "and" | "or" | "not"
+        "if" | "else" | "while" | "for" | "in" | "and" | "or" | "not" | "break" | "continue"
     )
 }
 

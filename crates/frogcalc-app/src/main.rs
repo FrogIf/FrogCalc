@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use frogcalc_core::eval::session::{
     AngleMode, DisplayMode, ExecResult, Session, Settings, WorkspaceItem,
 };
+use frogcalc_core::plot::{sample_2d, sample_surface, should_break};
 
 static LIGHT_THEME: AtomicBool = AtomicBool::new(false);
 
@@ -291,6 +292,98 @@ struct SavedState {
     mode: String,
     #[serde(default)]
     script: String,
+    #[serde(default)]
+    plot: PlotState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PlotState {
+    expression: String,
+    #[serde(default = "default_dimension")]
+    dimension: String,
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+    samples: usize,
+    surface_side: usize,
+    #[serde(default = "default_true")]
+    auto_y: bool,
+    #[serde(default)]
+    wireframe: bool,
+}
+
+fn default_dimension() -> String {
+    "2d".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for PlotState {
+    fn default() -> Self {
+        Self {
+            expression: "sin(x)".into(),
+            dimension: default_dimension(),
+            x_min: -10.0,
+            x_max: 10.0,
+            y_min: -10.0,
+            y_max: 10.0,
+            samples: 800,
+            surface_side: 44,
+            auto_y: true,
+            wireframe: false,
+        }
+    }
+}
+
+impl PlotState {
+    fn is_3d(&self) -> bool {
+        self.dimension == "3d"
+    }
+
+    fn signature(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.expression,
+            self.dimension,
+            self.x_min,
+            self.x_max,
+            self.y_min,
+            self.y_max,
+            self.samples,
+            self.surface_side,
+            self.auto_y,
+            self.wireframe
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PlotData {
+    Curve(Vec<Option<(f64, f64)>>),
+    Surface {
+        values: Vec<Option<f64>>,
+        nx: usize,
+        ny: usize,
+        y0: f64,
+        y1: f64,
+    },
+    Error(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileAction {
+    Import,
+    Export,
+}
+
+struct FileDialog {
+    action: FileAction,
+    directory: PathBuf,
+    filename: String,
+    error: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -312,6 +405,7 @@ impl Default for SavedState {
             workspace_source: String::new(),
             mode: default_mode(),
             script: String::new(),
+            plot: PlotState::default(),
         }
     }
 }
@@ -332,6 +426,13 @@ struct FrogApp {
     should_scroll: bool,
     focus_input: bool,
     focus_script: bool,
+    plot: PlotState,
+    plot_data: Option<PlotData>,
+    plot_signature: String,
+    plot_yaw: f32,
+    plot_pitch: f32,
+    focus_plot: bool,
+    file_dialog: Option<FileDialog>,
 }
 
 impl FrogApp {
@@ -348,10 +449,13 @@ impl FrogApp {
         let workspace = session.workspace();
         let mode = if saved.mode == "script" {
             "script".to_string()
+        } else if saved.mode == "plot" {
+            "plot".to_string()
         } else {
             "command".to_string()
         };
         let mode_is_script = mode == "script";
+        let mode_is_plot = mode == "plot";
         let app = Self {
             session,
             settings: saved.settings,
@@ -368,6 +472,13 @@ impl FrogApp {
             should_scroll: true,
             focus_input: !mode_is_script,
             focus_script: mode_is_script,
+            plot: saved.plot,
+            plot_data: None,
+            plot_signature: String::new(),
+            plot_yaw: -0.6,
+            plot_pitch: 0.55,
+            focus_plot: mode_is_plot,
+            file_dialog: None,
         };
         if migrated {
             let legacy = legacy_state_path();
@@ -406,6 +517,10 @@ impl FrogApp {
         self.mode == "script"
     }
 
+    fn is_plot(&self) -> bool {
+        self.mode == "plot"
+    }
+
     fn set_mode(&mut self, mode: &str) {
         if self.mode == mode {
             return;
@@ -413,6 +528,11 @@ impl FrogApp {
         self.mode = mode.to_string();
         if self.is_script() {
             self.focus_script = true;
+        } else if self.is_plot() {
+            self.focus_plot = true;
+            if self.plot_data.is_none() {
+                self.run_plot();
+            }
         } else {
             self.focus_input = true;
         }
@@ -445,6 +565,455 @@ impl FrogApp {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // 绘图
+    // -----------------------------------------------------------------------
+
+    fn run_plot(&mut self) {
+        let node = match self.session.compile_expression(&self.plot.expression) {
+            Ok(node) => node,
+            Err(error) => {
+                self.plot_data = Some(PlotData::Error(error.message));
+                self.plot_signature = self.plot.signature();
+                return;
+            }
+        };
+        if self.plot.is_3d() {
+            let surface = sample_surface(
+                &mut self.session,
+                &node,
+                "x",
+                "y",
+                self.plot.x_min,
+                self.plot.x_max,
+                self.plot.y_min,
+                self.plot.y_max,
+                self.plot.surface_side,
+            );
+            self.plot_data = Some(PlotData::Surface {
+                values: surface.values,
+                nx: surface.nx,
+                ny: surface.ny,
+                y0: surface.y0,
+                y1: surface.y1,
+            });
+        } else {
+            let curve = sample_2d(
+                &mut self.session,
+                &node,
+                "x",
+                self.plot.x_min,
+                self.plot.x_max,
+                self.plot.samples,
+            );
+            self.plot_data = Some(PlotData::Curve(curve.points));
+        }
+        self.plot_signature = self.plot.signature();
+        self.save();
+    }
+
+    fn plot_view(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("y =").size(15.0).color(accent()));
+            let width = (ui.available_width() - 230.0).max(150.0);
+            let response = ui.add(
+                TextEdit::singleline(&mut self.plot.expression)
+                    .hint_text("例如 sin(x)、x^2 - 2、x^2 - y^2")
+                    .font(TextStyle::Monospace)
+                    .text_color(text())
+                    .background_color(panel2())
+                    .desired_width(width)
+                    .margin(egui::Margin::symmetric(9, 7)),
+            );
+            let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if self.focus_plot {
+                response.request_focus();
+                self.focus_plot = false;
+            }
+            if ui
+                .button(RichText::new("绘制").size(11.5))
+                .on_hover_text("按当前参数重新采样")
+                .clicked()
+                || enter
+            {
+                self.run_plot();
+            }
+            if ui.selectable_label(!self.plot.is_3d(), "2D").clicked() {
+                self.plot.dimension = "2d".into();
+                self.run_plot();
+            }
+            if ui.selectable_label(self.plot.is_3d(), "3D").clicked() {
+                self.plot.dimension = "3d".into();
+                self.run_plot();
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("x ∈").size(10.0).color(dim()));
+            ui.add(
+                egui::DragValue::new(&mut self.plot.x_min)
+                    .speed(0.1)
+                    .max_decimals(2)
+                    .range(-1.0e6..=1.0e6),
+            );
+            ui.label(RichText::new("→").size(10.0).color(dim()));
+            ui.add(
+                egui::DragValue::new(&mut self.plot.x_max)
+                    .speed(0.1)
+                    .max_decimals(2)
+                    .range(-1.0e6..=1.0e6),
+            );
+            if self.plot.is_3d() {
+                ui.label(RichText::new("y ∈").size(10.0).color(dim()));
+                ui.add(
+                    egui::DragValue::new(&mut self.plot.y_min)
+                        .speed(0.1)
+                        .max_decimals(2)
+                        .range(-1.0e6..=1.0e6),
+                );
+                ui.label(RichText::new("→").size(10.0).color(dim()));
+                ui.add(
+                    egui::DragValue::new(&mut self.plot.y_max)
+                        .speed(0.1)
+                        .max_decimals(2)
+                        .range(-1.0e6..=1.0e6),
+                );
+                ui.label(RichText::new("网格").size(10.0).color(dim()));
+                ui.add(egui::DragValue::new(&mut self.plot.surface_side).range(8..=80));
+                ui.checkbox(&mut self.plot.wireframe, RichText::new("线框").size(10.0));
+            } else {
+                ui.checkbox(
+                    &mut self.plot.auto_y,
+                    RichText::new("自动 y 范围").size(10.0),
+                );
+                if !self.plot.auto_y {
+                    ui.label(RichText::new("y ∈").size(10.0).color(dim()));
+                    ui.add(
+                        egui::DragValue::new(&mut self.plot.y_min)
+                            .speed(0.1)
+                            .max_decimals(2)
+                            .range(-1.0e6..=1.0e6),
+                    );
+                    ui.label(RichText::new("→").size(10.0).color(dim()));
+                    ui.add(
+                        egui::DragValue::new(&mut self.plot.y_max)
+                            .speed(0.1)
+                            .max_decimals(2)
+                            .range(-1.0e6..=1.0e6),
+                    );
+                }
+                ui.label(RichText::new("采样").size(10.0).color(dim()));
+                ui.add(egui::DragValue::new(&mut self.plot.samples).range(32..=4000));
+            }
+            if self.plot_signature != self.plot.signature() {
+                ui.label(
+                    RichText::new("参数已修改，点击「绘制」更新")
+                        .size(9.5)
+                        .color(warn()),
+                );
+            }
+        });
+        ui.add_space(5.0);
+        if self.plot_data.is_none() {
+            self.run_plot();
+        }
+        let height = (ui.available_height() - 26.0).max(180.0);
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), height),
+            egui::Sense::drag(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 10.0, panel2());
+        match self.plot_data.clone() {
+            Some(PlotData::Error(message)) => {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    message,
+                    egui::FontId::proportional(12.0),
+                    danger(),
+                );
+            }
+            Some(PlotData::Curve(points)) => {
+                draw_curve(
+                    &painter,
+                    rect,
+                    &points,
+                    self.plot.x_min,
+                    self.plot.x_max,
+                    self.plot.auto_y,
+                    self.plot.y_min,
+                    self.plot.y_max,
+                );
+            }
+            Some(PlotData::Surface {
+                values,
+                nx,
+                ny,
+                y0,
+                y1,
+            }) => {
+                if response.dragged() {
+                    self.plot_yaw += response.drag_delta().x * 0.01;
+                    self.plot_pitch =
+                        (self.plot_pitch + response.drag_delta().y * 0.01).clamp(-1.45, 1.45);
+                }
+                draw_surface(
+                    &painter,
+                    rect,
+                    &values,
+                    nx,
+                    ny,
+                    y0,
+                    y1,
+                    self.plot.x_min,
+                    self.plot.x_max,
+                    self.plot_yaw,
+                    self.plot_pitch,
+                    self.plot.wireframe,
+                );
+            }
+            None => {}
+        }
+        ui.add_space(3.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(if self.plot.is_3d() {
+                    "3D 曲面 · 拖动旋转视角 · z 轴按数据自动缩放"
+                } else {
+                    "2D 曲线 · 函数、分段函数与用户函数都可绘制"
+                })
+                .size(9.0)
+                .color(dim()),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "x ∈ [{}, {}]",
+                        trim_number(self.plot.x_min),
+                        trim_number(self.plot.x_max)
+                    ))
+                    .size(9.0)
+                    .color(dim()),
+                );
+            });
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // 脚本文件导入 / 导出
+    // -----------------------------------------------------------------------
+
+    fn open_file_dialog(&mut self, action: FileAction) {
+        let directory = script_directory();
+        let filename = if action == FileAction::Export {
+            "script.frogcalc".to_string()
+        } else {
+            String::new()
+        };
+        self.file_dialog = Some(FileDialog {
+            action,
+            directory,
+            filename,
+            error: None,
+        });
+    }
+
+    fn import_script(&mut self, path: &Path) {
+        match fs::read_to_string(path) {
+            Ok(text) => {
+                self.script = text;
+                self.file_dialog = None;
+                self.set_mode("script");
+                self.focus_script = true;
+                self.save();
+                self.toast(format!("已导入 {}", path.display()));
+            }
+            Err(error) => {
+                let message = format!("读取失败：{error}");
+                if let Some(dialog) = self.file_dialog.as_mut() {
+                    dialog.error = Some(message.clone());
+                }
+                self.toast(message);
+            }
+        }
+    }
+
+    fn export_script(&mut self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match fs::write(path, &self.script) {
+            Ok(()) => {
+                self.file_dialog = None;
+                self.save();
+                self.toast(format!("已导出到 {}", path.display()));
+            }
+            Err(error) => {
+                let message = format!("写入失败：{error}");
+                if let Some(dialog) = self.file_dialog.as_mut() {
+                    dialog.error = Some(message.clone());
+                }
+                self.toast(message);
+            }
+        }
+    }
+
+    fn file_dialog_window(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.file_dialog.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut chosen: Option<PathBuf> = None;
+        let mut close = false;
+        let title = match dialog.action {
+            FileAction::Import => "导入脚本",
+            FileAction::Export => "导出脚本",
+        };
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([540.0, 430.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(480.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("目录").size(10.0).color(dim()));
+                    ui.label(
+                        RichText::new(dialog.directory.display().to_string())
+                            .size(10.0)
+                            .monospace()
+                            .color(muted()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button(RichText::new("↑ 上一级").size(10.0))
+                            .clicked()
+                        {
+                            if let Some(parent) = dialog.directory.parent() {
+                                dialog.directory = parent.to_path_buf();
+                            }
+                        }
+                    });
+                });
+                ui.separator();
+                let mut directories = Vec::new();
+                let mut files = Vec::new();
+                if let Ok(entries) = fs::read_dir(&dialog.directory) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            directories.push(path);
+                        } else if is_script_file(&path) {
+                            files.push(path);
+                        }
+                    }
+                }
+                directories.sort();
+                files.sort();
+                egui::ScrollArea::vertical()
+                    .id_salt("file_dialog_list")
+                    .max_height(280.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for directory in &directories {
+                            let name = directory
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            if ui
+                                .selectable_label(
+                                    false,
+                                    RichText::new(format!("📁 {name}")).size(11.0),
+                                )
+                                .clicked()
+                            {
+                                dialog.directory = directory.clone();
+                            }
+                        }
+                        for file in &files {
+                            let name = file
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            let selected = dialog.filename == name;
+                            if ui
+                                .selectable_label(
+                                    selected,
+                                    RichText::new(format!("📄 {name}")).size(11.0),
+                                )
+                                .clicked()
+                            {
+                                dialog.filename = name.clone();
+                                if dialog.action == FileAction::Import {
+                                    chosen = Some(file.clone());
+                                }
+                            }
+                        }
+                        if directories.is_empty() && files.is_empty() {
+                            ui.label(
+                                RichText::new("此目录下没有可用的脚本文件")
+                                    .size(10.5)
+                                    .color(dim()),
+                            );
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("文件名").size(10.0).color(dim()));
+                    ui.add(
+                        TextEdit::singleline(&mut dialog.filename)
+                            .desired_width(280.0)
+                            .hint_text("script.frogcalc"),
+                    );
+                });
+                if let Some(error) = &dialog.error {
+                    ui.label(RichText::new(error).size(10.0).color(danger()));
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let label = match dialog.action {
+                        FileAction::Import => "导入",
+                        FileAction::Export => "导出",
+                    };
+                    if ui.button(label).clicked() {
+                        let name = dialog.filename.trim();
+                        if name.is_empty() {
+                            dialog.error = Some("请输入文件名".into());
+                        } else {
+                            let path = dialog.directory.join(name);
+                            if dialog.action == FileAction::Import {
+                                if !path.exists() {
+                                    dialog.error = Some(format!("文件不存在：{}", path.display()));
+                                } else {
+                                    chosen = Some(path);
+                                }
+                            } else {
+                                chosen = Some(path);
+                            }
+                        }
+                    }
+                    if ui.button("取消").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if let Some(path) = chosen {
+            match dialog.action {
+                FileAction::Import => self.import_script(&path),
+                FileAction::Export => self.export_script(&path),
+            }
+            return;
+        }
+        if !open || close {
+            self.file_dialog = None;
+        } else {
+            self.file_dialog = Some(dialog);
+        }
+    }
+
     fn save(&self) -> bool {
         let state = SavedState {
             version: 1,
@@ -453,6 +1022,7 @@ impl FrogApp {
             workspace_source: self.session.workspace_source(),
             mode: self.mode.clone(),
             script: self.script.clone(),
+            plot: self.plot.clone(),
         };
         if let Ok(text) = serde_json::to_string(&state) {
             let path = state_path();
@@ -538,7 +1108,9 @@ impl FrogApp {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        for (value, label) in [("command", "命令"), ("script", "脚本")] {
+                        for (value, label) in
+                            [("command", "命令"), ("script", "脚本"), ("plot", "绘图")]
+                        {
                             if ui
                                 .selectable_label(
                                     self.mode == value,
@@ -603,6 +1175,14 @@ impl FrogApp {
         } else {
             let items = self.workspace.clone();
             for item in items {
+                if item.kind == "assumption" {
+                    ui.label(
+                        RichText::new(format!("assume {} {}", item.name, item.plain))
+                            .size(10.5)
+                            .color(violet()),
+                    );
+                    continue;
+                }
                 let label = if let Some(sig) = &item.signature {
                     format!("{}\n{}", sig, item.value_type)
                 } else {
@@ -652,6 +1232,8 @@ impl FrogApp {
             "a = 1/3      精确分数",
             "f(x) = x^2+1 定义函数",
             "2x + 3(x-1) 隐式乘法",
+            "piecewise    分段函数",
+            "assume(x>0)  变量假设",
             "help(\"syntax\") 帮助",
         ] {
             ui.label(RichText::new(line).size(10.0).color(dim()));
@@ -911,6 +1493,20 @@ impl FrogApp {
                     run_icon_button(ui, egui::vec2(40.0, 28.0)).on_hover_text("运行 (Ctrl+Enter)");
                 if run.clicked() {
                     self.execute_script();
+                }
+                if ui
+                    .small_button(RichText::new("导出").size(10.5).color(dim()))
+                    .on_hover_text("导出脚本 (Ctrl+S)")
+                    .clicked()
+                {
+                    self.open_file_dialog(FileAction::Export);
+                }
+                if ui
+                    .small_button(RichText::new("导入").size(10.5).color(dim()))
+                    .on_hover_text("导入脚本 (Ctrl+O)，也可以直接把文件拖进窗口")
+                    .clicked()
+                {
+                    self.open_file_dialog(FileAction::Import);
                 }
                 if self.script.trim().is_empty() {
                     if ui
@@ -1348,7 +1944,22 @@ impl eframe::App for FrogApp {
             )
             .show(ui, |ui| self.top_bar(ui));
 
-        if self.is_script() {
+        if ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::O)) {
+            self.open_file_dialog(FileAction::Import);
+        }
+        if ui.input(|input| input.modifiers.command && input.key_pressed(egui::Key::S)) {
+            self.open_file_dialog(FileAction::Export);
+        }
+
+        if self.is_plot() {
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(central_bg())
+                        .inner_margin(egui::Margin::symmetric(18, 10)),
+                )
+                .show(ui, |ui| self.plot_view(ui));
+        } else if self.is_script() {
             egui::Panel::bottom("script_results")
                 .resizable(true)
                 .default_size(280.0)
@@ -1403,7 +2014,23 @@ impl eframe::App for FrogApp {
         self.settings_window(ui.ctx());
         self.help_window(ui.ctx());
         self.confirm_window(ui.ctx());
+        self.file_dialog_window(ui.ctx());
         self.toast_view(ui.ctx());
+        let dropped: Vec<PathBuf> = ui.ctx().input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| Some(file.path().to_path_buf()))
+                .collect()
+        });
+        if let Some(path) = dropped.first() {
+            if is_script_file(path) {
+                self.import_script(path);
+            } else {
+                self.toast("只支持 .frogcalc / .frog / .calc / .txt 脚本文件");
+            }
+        }
         if self.should_scroll {
             self.should_scroll = false;
         }
@@ -1516,6 +2143,366 @@ fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
         .show(ui, |ui| {
             ui.label(RichText::new(text).size(9.5).color(color));
         });
+}
+
+fn nice_step(range: f64) -> f64 {
+    if !range.is_finite() || range <= 0.0 {
+        return 1.0;
+    }
+    let raw = range / 8.0;
+    let exponent = raw.log10().floor();
+    let base = 10f64.powf(exponent);
+    let fraction = raw / base;
+    let nice = if fraction <= 1.0 {
+        1.0
+    } else if fraction <= 2.0 {
+        2.0
+    } else if fraction <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    nice * base
+}
+
+fn trim_number(value: f64) -> String {
+    if !value.is_finite() {
+        return "-".into();
+    }
+    let text = format!("{value:.4}");
+    let text = text.trim_end_matches('0').trim_end_matches('.').to_string();
+    if text == "-0" {
+        "0".into()
+    } else {
+        text
+    }
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+}
+
+fn draw_curve(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    points: &[Option<(f64, f64)>],
+    x_min: f64,
+    x_max: f64,
+    auto_y: bool,
+    fixed_y_min: f64,
+    fixed_y_max: f64,
+) {
+    let area = rect.shrink2(egui::vec2(34.0, 16.0));
+    let (x0, x1) = if (x_max - x_min).abs() < 1e-12 {
+        (x_min - 1.0, x_max + 1.0)
+    } else {
+        (x_min, x_max)
+    };
+    let (mut y0, mut y1) = (fixed_y_min, fixed_y_max);
+    if auto_y {
+        let mut low = f64::INFINITY;
+        let mut high = f64::NEG_INFINITY;
+        for (_, y) in points.iter().flatten() {
+            if y.is_finite() {
+                low = low.min(*y);
+                high = high.max(*y);
+            }
+        }
+        if !low.is_finite() || !high.is_finite() {
+            low = -1.0;
+            high = 1.0;
+        }
+        if (high - low).abs() < 1e-9 {
+            low -= 1.0;
+            high += 1.0;
+        }
+        let padding = (high - low) * 0.08;
+        y0 = low - padding;
+        y1 = high + padding;
+    }
+    if (y1 - y0).abs() < 1e-12 {
+        y1 = y0 + 1.0;
+    }
+    let to_screen = |x: f64, y: f64| {
+        let px = area.left() + ((x - x0) / (x1 - x0)) as f32 * area.width();
+        let py = area.bottom() - ((y - y0) / (y1 - y0)) as f32 * area.height();
+        egui::pos2(px, py)
+    };
+
+    let step_x = nice_step(x1 - x0);
+    let step_y = nice_step(y1 - y0);
+    let grid = Color32::from_rgba_unmultiplied(border().r(), border().g(), border().b(), 140);
+    let mut gx = (x0 / step_x).ceil() * step_x;
+    while gx <= x1 {
+        let px = to_screen(gx, y0).x;
+        painter.line_segment(
+            [egui::pos2(px, area.top()), egui::pos2(px, area.bottom())],
+            Stroke::new(1.0, grid),
+        );
+        painter.text(
+            egui::pos2(px + 2.0, area.bottom() + 2.0),
+            egui::Align2::LEFT_TOP,
+            trim_number(gx),
+            egui::FontId::proportional(8.5),
+            dim(),
+        );
+        gx += step_x;
+    }
+    let mut gy = (y0 / step_y).ceil() * step_y;
+    while gy <= y1 {
+        let py = to_screen(x0, gy).y;
+        painter.line_segment(
+            [egui::pos2(area.left(), py), egui::pos2(area.right(), py)],
+            Stroke::new(1.0, grid),
+        );
+        painter.text(
+            egui::pos2(area.left() - 3.0, py),
+            egui::Align2::RIGHT_CENTER,
+            trim_number(gy),
+            egui::FontId::proportional(8.5),
+            dim(),
+        );
+        gy += step_y;
+    }
+    let axis = Stroke::new(1.2, muted());
+    if x0 <= 0.0 && x1 >= 0.0 {
+        let px = to_screen(0.0, y0).x;
+        painter.line_segment(
+            [egui::pos2(px, area.top()), egui::pos2(px, area.bottom())],
+            axis,
+        );
+    }
+    if y0 <= 0.0 && y1 >= 0.0 {
+        let py = to_screen(x0, 0.0).y;
+        painter.line_segment(
+            [egui::pos2(area.left(), py), egui::pos2(area.right(), py)],
+            axis,
+        );
+    }
+
+    let stroke = Stroke::new(1.8, accent());
+    let y_span = y1 - y0;
+    let mut segment: Vec<egui::Pos2> = Vec::new();
+    let mut previous: Option<f64> = None;
+    for point in points {
+        match point {
+            Some((x, y)) if y.is_finite() => {
+                if should_break(previous, Some(*y), y_span) && !segment.is_empty() {
+                    if segment.len() > 1 {
+                        painter.add(egui::Shape::line(std::mem::take(&mut segment), stroke));
+                    } else {
+                        segment.clear();
+                    }
+                }
+                segment.push(to_screen(*x, *y));
+                previous = Some(*y);
+            }
+            _ => {
+                if segment.len() > 1 {
+                    painter.add(egui::Shape::line(std::mem::take(&mut segment), stroke));
+                } else {
+                    segment.clear();
+                }
+                previous = None;
+            }
+        }
+    }
+    if segment.len() > 1 {
+        painter.add(egui::Shape::line(segment, stroke));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_surface(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    values: &[Option<f64>],
+    nx: usize,
+    ny: usize,
+    y0: f64,
+    y1: f64,
+    x_min: f64,
+    x_max: f64,
+    yaw: f32,
+    pitch: f32,
+    wireframe: bool,
+) {
+    let (x0, x1) = if (x_max - x_min).abs() < 1e-12 {
+        (x_min - 1.0, x_max + 1.0)
+    } else {
+        (x_min, x_max)
+    };
+    let (y0, y1) = if (y1 - y0).abs() < 1e-12 {
+        (y0 - 1.0, y0 + 1.0)
+    } else {
+        (y0, y1)
+    };
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    for value in values.iter().flatten() {
+        if value.is_finite() {
+            low = low.min(*value);
+            high = high.max(*value);
+        }
+    }
+    if !low.is_finite() || !high.is_finite() {
+        low = -1.0;
+        high = 1.0;
+    }
+    if (high - low).abs() < 1e-9 {
+        low -= 1.0;
+        high += 1.0;
+    }
+    let padding = (high - low) * 0.05;
+    let (z0, z1) = (low - padding, high + padding);
+    let cos_yaw = yaw.cos();
+    let sin_yaw = yaw.sin();
+    let cos_pitch = pitch.cos();
+    let sin_pitch = pitch.sin();
+    let scale = rect.width().min(rect.height()) as f64 * 0.36;
+    let center = rect.center();
+    let project = |x: f64, y: f64, z: f64| -> (egui::Pos2, f64) {
+        let xn = ((x - x0) / (x1 - x0)) * 2.0 - 1.0;
+        let yn = ((y - y0) / (y1 - y0)) * 2.0 - 1.0;
+        let zn = ((z - z0) / (z1 - z0)) * 2.0 - 1.0;
+        let rx = xn * cos_yaw as f64 - yn * sin_yaw as f64;
+        let spin = xn * sin_yaw as f64 + yn * cos_yaw as f64;
+        // 屏幕 y 向下：抬高的点向上移动，视线深度随 z 减小（高处更靠近观察者）。
+        let ry = -(zn * cos_pitch as f64 + spin * sin_pitch as f64);
+        let depth = spin * cos_pitch as f64 - zn * sin_pitch as f64;
+        (
+            egui::pos2(
+                center.x + (rx * scale) as f32,
+                center.y + (ry * scale) as f32,
+            ),
+            depth,
+        )
+    };
+    let x_at = |i: usize| x0 + (x1 - x0) * i as f64 / (nx.saturating_sub(1).max(1)) as f64;
+    let y_at = |j: usize| y0 + (y1 - y0) * j as f64 / (ny.saturating_sub(1).max(1)) as f64;
+    let value_at = |i: usize, j: usize| values.get(j * nx + i).copied().flatten();
+
+    if wireframe {
+        let stroke = Stroke::new(1.0, accent().gamma_multiply(0.85));
+        for j in 0..ny {
+            let mut line = Vec::new();
+            for i in 0..nx {
+                if let Some(z) = value_at(i, j) {
+                    line.push(project(x_at(i), y_at(j), z).0);
+                } else if line.len() > 1 {
+                    painter.add(egui::Shape::line(std::mem::take(&mut line), stroke));
+                } else {
+                    line.clear();
+                }
+            }
+            if line.len() > 1 {
+                painter.add(egui::Shape::line(line, stroke));
+            }
+        }
+        for i in 0..nx {
+            let mut line = Vec::new();
+            for j in 0..ny {
+                if let Some(z) = value_at(i, j) {
+                    line.push(project(x_at(i), y_at(j), z).0);
+                } else if line.len() > 1 {
+                    painter.add(egui::Shape::line(
+                        std::mem::take(&mut line),
+                        Stroke::new(1.0, violet().gamma_multiply(0.7)),
+                    ));
+                } else {
+                    line.clear();
+                }
+            }
+            if line.len() > 1 {
+                painter.add(egui::Shape::line(
+                    line,
+                    Stroke::new(1.0, violet().gamma_multiply(0.7)),
+                ));
+            }
+        }
+        return;
+    }
+
+    let mut cells: Vec<(f64, [egui::Pos2; 4], f64)> = Vec::new();
+    for j in 0..ny.saturating_sub(1) {
+        for i in 0..nx.saturating_sub(1) {
+            let corners = [
+                value_at(i, j),
+                value_at(i + 1, j),
+                value_at(i + 1, j + 1),
+                value_at(i, j + 1),
+            ];
+            let Some(zs) = corners
+                .iter()
+                .map(|z| *z)
+                .collect::<Option<Vec<f64>>>()
+                .map(|v| {
+                    let average = v.iter().sum::<f64>() / v.len() as f64;
+                    average
+                })
+            else {
+                continue;
+            };
+            let mut positions = [egui::Pos2::ZERO; 4];
+            let mut depth = 0.0;
+            let mut valid = true;
+            for (k, (pi, pj)) in [(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)]
+                .iter()
+                .enumerate()
+            {
+                if let Some(z) = value_at(*pi, *pj) {
+                    let (pos, d) = project(x_at(*pi), y_at(*pj), z);
+                    positions[k] = pos;
+                    depth += d;
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                cells.push((depth / 4.0, positions, zs));
+            }
+        }
+    }
+    cells.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let span = (z1 - z0).max(1e-12);
+    for (_, positions, z) in cells {
+        let t = ((z - z0) / span).clamp(0.0, 1.0) as f32;
+        let base = lerp_color(accent(), violet(), t * 0.75);
+        let shade = 0.45 + 0.65 * (1.0 - t);
+        let color = Color32::from_rgba_unmultiplied(
+            (base.r() as f32 * shade) as u8,
+            (base.g() as f32 * shade) as u8,
+            (base.b() as f32 * shade) as u8,
+            232,
+        );
+        painter.add(egui::Shape::convex_polygon(
+            positions.to_vec(),
+            color,
+            Stroke::NONE,
+        ));
+    }
+}
+
+fn script_directory() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn is_script_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_lowercase().as_str(),
+                "frogcalc" | "frog" | "calc" | "txt"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn run_icon_button(ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
@@ -1647,6 +2634,9 @@ fn help_content(ui: &mut egui::Ui) {
             "x^2 - 2x - 3 == 0        方程表达式，可直接传给 solve",
             "if x > 0 { y = 1 }       条件分支，可加 else",
             "for i in range(1, 10) { total = total + i }  循环",
+            "while / for 内可用 break 与 continue",
+            "f(x) = piecewise(x < 0, -x, x)  分段函数",
+            "assume(x > 0)            变量假设，增强化简",
             "{1, 2, 3}                列表字面量",
             "ans                      上一次结果",
             "# 这是行注释",
@@ -1664,6 +2654,12 @@ fn help_content(ui: &mut egui::Ui) {
             ("< <= > >= !=", "大小比较，结果为 true / false"),
             ("and / or / not", "逻辑运算，支持短路"),
             ("if / while / for", "分支与循环，使用 { } 包围代码块"),
+            ("break / continue", "跳出循环 / 跳过本次迭代"),
+            (
+                "piecewise(c1, v1[, c2, v2 ...][, 默认])",
+                "分段函数，条件按顺序判断",
+            ),
+            ("assume(x > 0)", "为变量添加假设（>、>=、<、<=、!=）"),
             ("f(x) = { ... }", "多语句函数，最后一个语句为返回值"),
             ("range(a, b[, step])", "生成整数列表，包含 b"),
             ("true / false", "布尔值"),
@@ -1684,8 +2680,16 @@ fn help_content(ui: &mut egui::Ui) {
                 "上方多行编辑，Ctrl+Enter 运行整段脚本；下方列出变量与最终结果",
             ),
             (
+                "绘图模式",
+                "输入 f(x) 或 f(x, y)，在 2D 曲线与 3D 曲面之间切换，拖动旋转 3D 视角",
+            ),
+            (
                 "脚本规则",
                 "按书写顺序执行；遇到错误停止后续语句；; 抑制该句输出",
+            ),
+            (
+                "脚本文件",
+                "脚本模式支持导入/导出（Ctrl+O / Ctrl+S），也可以直接把脚本文件拖进窗口",
             ),
             (
                 "清空按钮",
@@ -1730,6 +2734,8 @@ fn help_content(ui: &mut egui::Ui) {
                 "范围循环，包含终点；range(起, 终[, 步长])",
             ),
             ("for x in {1, 2, 3} { ... }", "遍历列表"),
+            ("break", "立即结束最内层循环"),
+            ("continue", "跳过本次迭代的剩余语句"),
             ("and / or / not", "逻辑运算，and / or 短路"),
             ("< <= > >= != ==", "比较，得到 true / false"),
         ],
@@ -1786,6 +2792,10 @@ fn help_content(ui: &mut egui::Ui) {
                 "N(expr[, digits])",
                 "近似求值；默认 50 位有效数字，可指定 10–500 位",
             ),
+            (
+                "recurring(\"0.1(3)\")",
+                "无限循环小数转精确分数（循环节用 ( ) 或 [ ] 包围）",
+            ),
             ("setprecision(n)", "修改默认近似精度"),
             (
                 "setangle(\"deg\")",
@@ -1841,6 +2851,49 @@ fn help_content(ui: &mut egui::Ui) {
         ],
     );
 
+    help_heading(ui, "变量假设与分段函数");
+    ui.label(
+        RichText::new(
+            "假设会随工作区一起保存。它影响结果展示与 simplify：例如 assume(x > 0) 之后，sqrt(x^2) 显示为 x、abs(x) 显示为 x；工作区里存放的仍是原始表达式。",
+        )
+        .size(11.0)
+        .color(muted()),
+    );
+    help_table(
+        ui,
+        &[
+            ("assume(x > 0)", "记录假设，支持 >、>=、<、<=、!= 与 0 比较"),
+            ("assumptions()", "列出当前所有假设"),
+            ("forget(x)", "删除变量 x 的假设"),
+            ("clearassumptions()", "清除全部假设"),
+            (
+                "piecewise(c1, v1, c2, v2, 默认)",
+                "分段函数；条件依次判断，只有全部为假时才取默认值",
+            ),
+            ("diff(piecewise(...), x)", "逐段求导，条件保持不变"),
+        ],
+    );
+
+    help_heading(ui, "绘图");
+    ui.label(
+        RichText::new(
+            "绘图模式重新采样并绘制当前表达式：2D 使用 x，3D 使用 x 与 y。用户函数、变量、分段函数与角度制设置都会生效。",
+        )
+        .size(11.0)
+        .color(muted()),
+    );
+    help_table(
+        ui,
+        &[
+            ("y = sin(x)", "2D 曲线；自动确定 y 范围，也可手动指定"),
+            ("x^2 - y^2", "3D 曲面；鼠标拖动旋转视角"),
+            ("x ∈ [a, b]", "采样区间，3D 时另有 y ∈ [c, d]"),
+            ("采样 / 网格", "2D 采样点数量与 3D 网格密度"),
+            ("线框", "3D 只绘制网格线，不填充曲面"),
+            ("绘制", "按当前参数重新采样；修改参数后需要再次点击"),
+        ],
+    );
+
     help_heading(ui, "工作区命令");
     help_table(
         ui,
@@ -1867,6 +2920,7 @@ fn help_content(ui: &mut egui::Ui) {
             "integrate(1/(x^2-1), x)  # 有理函数积分",
             "solve(sin(x) == 0, x)    # 主值分支",
             "N(pi, 50)                # 50 位圆周率",
+            "a = recurring(\"0.1(3)\")  # 2/15",
         ],
     );
 
@@ -1874,9 +2928,10 @@ fn help_content(ui: &mut egui::Ui) {
     for line in [
         "• 三角/周期方程只给出主值分支，不自动生成 + 2πk 通解。",
         "• 无法求出的积分会保留 integrate(...) 未求值形式，不会猜测结果。",
-        "• 高次多项式没有全部有理根时，剩余根使用 Durand–Kerner 数值求根并标注近似。",
+        "• 有理函数积分覆盖重根与二次不可约因子；更高次不可约因子仍需数值积分。",
+        "• 高次多项式已使用 Berlekamp–Zassenhaus 分解；超过次数上限时退回有理根 + Durand–Kerner 数值求根。",
         "• 近似结果没有严格的最后一位正确性保证；需要精确时请保持分数/根式/符号形式。",
-        "• 矩阵与绘图尚未实现；函数内暂不支持嵌套定义函数与 break/continue。",
+        "• 矩阵运算尚未实现；绘图目前只支持单条表达式，不支持参数曲线与隐函数。",
     ] {
         ui.label(RichText::new(line).size(10.5).color(muted()));
     }

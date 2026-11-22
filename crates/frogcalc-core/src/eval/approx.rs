@@ -291,6 +291,64 @@ fn eval_call(name: &str, args: &[Expr], p: usize) -> Result<CNum, CalcError> {
         .cloned()
         .ok_or_else(|| CalcError::new("函数缺少参数"))?;
     match name.to_lowercase().as_str() {
+        "lt" | "le" | "gt" | "ge" | "neq" => {
+            let other = values
+                .get(1)
+                .ok_or_else(|| CalcError::new("比较需要 2 个参数"))?;
+            if !a.im.is_zero() || !other.im.is_zero() {
+                return Err(CalcError::new("复数不能直接比较大小"));
+            }
+            let ordering = a.re.compare(&other.re);
+            let result = match name.to_lowercase().as_str() {
+                "lt" => ordering == Ordering::Less,
+                "le" => ordering != Ordering::Greater,
+                "gt" => ordering == Ordering::Greater,
+                "ge" => ordering != Ordering::Less,
+                _ => ordering != Ordering::Equal,
+            };
+            Ok(CNum {
+                re: if result { one(p) } else { zero(p) },
+                im: zero(p),
+            })
+        }
+        "and" | "or" => {
+            let other = values
+                .get(1)
+                .ok_or_else(|| CalcError::new("逻辑运算需要 2 个参数"))?;
+            let left = !a.re.is_zero();
+            let right = !other.re.is_zero();
+            let result = if name.eq_ignore_ascii_case("and") {
+                left && right
+            } else {
+                left || right
+            };
+            Ok(CNum {
+                re: if result { one(p) } else { zero(p) },
+                im: zero(p),
+            })
+        }
+        "not" => Ok(CNum {
+            re: if a.re.is_zero() { one(p) } else { zero(p) },
+            im: zero(p),
+        }),
+        "piecewise" => {
+            let pairs = values.len() / 2;
+            for i in 0..pairs {
+                let condition = &values[2 * i];
+                if !condition.im.is_zero() {
+                    return Err(CalcError::new("piecewise 的条件必须是实数"));
+                }
+                if !condition.re.is_zero() {
+                    return Ok(values[2 * i + 1].clone());
+                }
+            }
+            if values.len() % 2 == 1 {
+                if let Some(default) = values.last() {
+                    return Ok(default.clone());
+                }
+            }
+            Err(CalcError::new("piecewise 没有分支匹配"))
+        }
         "sqrt" => csqrt(&a, p),
         "exp" => cexp(&a, p),
         "ln" => cln(&a, p),

@@ -10,7 +10,7 @@
 
 ```bash
 cargo run -p frogcalc-app                 # dev UI (debug build keeps a console for logs)
-cargo test -p frogcalc-core               # 20 core tests
+cargo test -p frogcalc-core               # 27 core tests
 cargo check -p frogcalc-app               # faster UI compile check
 cargo fmt --all                           # requires rustfmt component
 cargo build --release -p frogcalc-app     # release GUI, no console
@@ -51,13 +51,18 @@ No CI, pre-commit, lint, or typecheck config exists. Do not invent one.
 ## Non-obvious code facts
 
 - `crates/frogcalc-core/src/symbolic/format_expr.rs` is included with `include!("format_expr.rs")` inside `symbolic/expr.rs`. It is one module; edit both together.
-- `symbolic/transform.rs` handles expand/simplify/factor; `polynomial.rs` handles rational roots and Durand–Kerner; `calculus/integrate.rs` is rule-based and returns an unevaluated `integrate(...)` call when unsupported.
+- `symbolic/transform.rs` handles expand/simplify/factor; `factor_int.rs` implements Berlekamp–Zassenhaus (mod-p Berlekamp + Hensel lifting via linear congruences + Zassenhaus recombination); `polynomial.rs` handles square-free decomposition, rational roots, quadratic formulas and Durand–Kerner; `calculus/integrate.rs` is rule-based (partial fractions with multiplicities, log-derivative matching) and returns an unevaluated `integrate(...)` call when unsupported.
+- `symbolic/assume.rs` stores per-symbol sign facts. `Session::format_value` and the `simplify/expand/factor` builtins apply `Assumptions::rewrite`; stored workspace expressions are never rewritten. Assumptions round-trip through `workspace_source` as `assume(x > 0)` lines.
+- `plot.rs` samples expressions through `Session::compile_expression` + `Session::eval_sample` (bindings become `Float`), so user functions and `piecewise` work in plots; the app renders 2D polylines and 3D height fields with the egui painter (no extra crates).
+- `numeric/recurring.rs` parses recurring-decimal text (`recurring("0.1(3)")`) with the geometric-series formula `I + N/10^n + R/(10^n(10^m-1))`, returning an exact `BigRational`; `()` and `[]` mark the repeating block, and `recurring` is a reserved builtin that also accepts an ordinary numeric literal.
 - Parser semantics: `=` is assignment/function definition, `==` is an equation for `solve` (and equality in conditions); implicit multiplication is supported; `;` separates statements and suppresses that statement's output; newlines are allowed inside `()`/`{}`.
-- Script control flow: `if`/`else if`/`else`, `while`, and `for x in range(...) | {list} { ... }`; conditions use `< <= > >= != ==` and short-circuiting `and`/`or`/`not`. Comparisons are parsed into `lt/le/gt/ge/neq/and/or/not` calls, so they round-trip through `workspace_source`. Control statements return `None` from `eval_statement` (no display result) and loop iterations are capped at 100000.
+- Script control flow: `if`/`else if`/`else`, `while`, `for x in range(...) | {list} { ... }`, plus `break`/`continue`. `eval_statement_value` returns an internal `Flow` enum (`Value`/`Break`/`Continue`); `Session.loop_depth` rejects `break` outside loops and is reset to 0 across function-call boundaries. Conditions use `< <= > >= != ==` and short-circuiting `and`/`or`/`not`. Comparisons are parsed into `lt/le/gt/ge/neq/and/or/not` calls and printed back as infix, so they round-trip through `workspace_source`. Control statements return `None` from `eval_statement` (no display result) and loop iterations are capped at 100000.
+- `piecewise(cond1, value1[, cond2, value2 ...][, default])` is a lazy special form in `eval_call` (unevaluable conditions keep a symbolic `piecewise`); `diff` differentiates branches only, and the approximation path learns `lt/le/...`, `and/or/not` and `piecewise`.
 - Function definitions: `f(x) = expr` and `f(x) = { statements }`. Block bodies push a local scope (`Session.scopes`); the last statement value is returned, and assignments inside functions never touch globals. Nested function definitions are rejected; recursion uses the existing 200-call depth guard. `{1, 2, 3}` after `=` is still parsed as a list via `brace_starts_block`.
-- Tests live in `crates/frogcalc-core/tests/{numeric,session}.rs`; there are no unit tests inside `lib.rs`.
-- App persistence path is `<exe 所在目录>\state.json` (portable; history, settings, workspace source, mode, script text). On first run it migrates `%APPDATA%\FrogCalc\state.json` and renames the old file to `state.json.bak`. Delete the local `state.json` to reset history/workspace/theme during manual testing.
-- Two input modes share one `Session`: `command` uses the single-line `input` + Enter; `script` uses the multiline `script` buffer + Ctrl+Enter, keeps the latest run in `last_script` (no history entries), and lists variables + the final result in the bottom results panel. `Session::execute` already runs multi-statement text and stops at the first error.
+- Tests live in `crates/frogcalc-core/tests/{numeric,session,features}.rs`; there are no unit tests inside `lib.rs`.
+- App persistence path is `<exe 所在目录>\state.json` (portable; history, settings, workspace source, mode, script text, plot state). On first run it migrates `%APPDATA%\FrogCalc\state.json` and renames the old file to `state.json.bak`. Delete the local `state.json` to reset history/workspace/theme during manual testing.
+- Three modes share one `Session`: `command` uses the single-line `input` + Enter; `script` uses the multiline `script` buffer + Ctrl+Enter, keeps the latest run in `last_script` (no history entries), and lists variables + the final result in the bottom results panel; `plot` re-samples the `plot` expression into `plot_data` (cached, recomputed on 绘制 / mode switch) and renders 2D or 3D. `Session::execute` already runs multi-statement text and stops at the first error.
+- Script import/export uses an in-app file dialog (`FileDialog`) plus drag-and-drop; there is no native file-picker dependency. Accepted suffixes: `.frogcalc`, `.frog`, `.calc`, `.txt`. Shortcuts: Ctrl+O / Ctrl+S.
 - Theme colors are global functions backed by `LIGHT_THEME` (`AtomicBool`). Keep using `bg()`, `panel()`, `text()`, etc.; avoid new hardcoded colors. Theme changes must call `install_style`, which also sets the global light flag.
 - Help content is static in `help_content` in `crates/frogcalc-app/src/main.rs`; update it when adding syntax/functions.
 - History timestamps are currently hardcoded UTC+8 in `time_now`.

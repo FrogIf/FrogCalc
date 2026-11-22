@@ -1,3 +1,4 @@
+pub mod assume;
 pub mod expr;
 pub mod transform;
 

@@ -1,7 +1,101 @@
 const PREC_EQ: i32 = 5;
+const PREC_CMP: i32 = 8;
 const PREC_ADD: i32 = 10;
 const PREC_MUL: i32 = 20;
 const PREC_POW: i32 = 30;
+
+fn comparison_operator(name: &str) -> Option<&'static str> {
+    match name.to_lowercase().as_str() {
+        "lt" => Some("<"),
+        "le" => Some("<="),
+        "gt" => Some(">"),
+        "ge" => Some(">="),
+        "neq" => Some("!="),
+        _ => None,
+    }
+}
+
+fn plain_logic(name: &str, args: &[Expr]) -> Option<String> {
+    match (name, args.len()) {
+        ("and", 2) => Some(format!(
+            "{} and {}",
+            plain(&args[0], PREC_CMP),
+            plain(&args[1], PREC_CMP)
+        )),
+        ("or", 2) => Some(format!(
+            "{} or {}",
+            plain(&args[0], PREC_CMP),
+            plain(&args[1], PREC_CMP)
+        )),
+        ("not", 1) => Some(format!("not {}", plain(&args[0], PREC_CMP))),
+        _ => None,
+    }
+}
+
+fn unicode_logic(name: &str, args: &[Expr]) -> Option<String> {
+    match (name, args.len()) {
+        ("and", 2) => Some(format!(
+            "{} ∧ {}",
+            unicode(&args[0], PREC_CMP),
+            unicode(&args[1], PREC_CMP)
+        )),
+        ("or", 2) => Some(format!(
+            "{} ∨ {}",
+            unicode(&args[0], PREC_CMP),
+            unicode(&args[1], PREC_CMP)
+        )),
+        ("not", 1) => Some(format!("¬{}", unicode(&args[0], PREC_CMP))),
+        _ => None,
+    }
+}
+
+fn latex_logic(name: &str, args: &[Expr]) -> Option<String> {
+    match (name, args.len()) {
+        ("and", 2) => Some(format!(
+            "{} \\land {}",
+            latex(&args[0], PREC_CMP),
+            latex(&args[1], PREC_CMP)
+        )),
+        ("or", 2) => Some(format!(
+            "{} \\lor {}",
+            latex(&args[0], PREC_CMP),
+            latex(&args[1], PREC_CMP)
+        )),
+        ("not", 1) => Some(format!("\\lnot {}", latex(&args[0], PREC_CMP))),
+        _ => None,
+    }
+}
+
+fn plain_call(name: &str, args: &[Expr]) -> String {
+    format!(
+        "{name}({})",
+        args.iter()
+            .map(|a| plain(a, 0))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn unicode_call(name: &str, args: &[Expr]) -> String {
+    format!(
+        "{name}({})",
+        args.iter()
+            .map(|a| unicode(a, 0))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn latex_call(name: &str, args: &[Expr]) -> String {
+    format!(
+        "{}\\left({}\\right)",
+        name,
+        args.iter()
+            .map(|a| latex(a, 0))
+            .collect::<Vec<_>>()
+            .join(",\\; ")
+    )
+}
 
 fn sign_of(expr: &Expr) -> i8 {
     match expr {
@@ -104,13 +198,27 @@ fn plain(expr: &Expr, parent: i32) -> String {
         }
         Expr::Mul(factors) => paren(plain_mul(factors), PREC_MUL < parent, false),
         Expr::Pow(base, exp) => paren(plain_pow(base, exp), PREC_POW < parent, false),
-        Expr::Call(name, args) => format!(
-            "{name}({})",
-            args.iter()
-                .map(|a| plain(a, 0))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        Expr::Call(name, args) => {
+            if let Some(text) = plain_logic(name, args) {
+                text
+            } else if let Some(op) = comparison_operator(name) {
+                if args.len() == 2 {
+                    paren(
+                        format!(
+                            "{} {op} {}",
+                            plain(&args[0], PREC_CMP + 1),
+                            plain(&args[1], PREC_CMP + 1)
+                        ),
+                        PREC_CMP < parent,
+                        false,
+                    )
+                } else {
+                    plain_call(name, args)
+                }
+            } else {
+                plain_call(name, args)
+            }
+        }
         Expr::Eq(lhs, rhs) => paren(
             format!("{} = {}", plain(lhs, 0), plain(rhs, 0)),
             PREC_EQ < parent,
@@ -257,13 +365,33 @@ fn unicode(expr: &Expr, parent: i32) -> String {
         }
         Expr::Mul(factors) => paren(unicode_mul(factors), PREC_MUL < parent, false),
         Expr::Pow(base, exp) => paren(unicode_pow(base, exp), PREC_POW < parent, false),
-        Expr::Call(name, args) => format!(
-            "{name}({})",
-            args.iter()
-                .map(|a| unicode(a, 0))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        Expr::Call(name, args) => {
+            if let Some(text) = unicode_logic(name, args) {
+                text
+            } else if let Some(op) = comparison_operator(name) {
+                if args.len() == 2 {
+                    let op = match op {
+                        "<=" => "≤",
+                        ">=" => "≥",
+                        "!=" => "≠",
+                        other => other,
+                    };
+                    paren(
+                        format!(
+                            "{} {op} {}",
+                            unicode(&args[0], PREC_CMP + 1),
+                            unicode(&args[1], PREC_CMP + 1)
+                        ),
+                        PREC_CMP < parent,
+                        false,
+                    )
+                } else {
+                    unicode_call(name, args)
+                }
+            } else {
+                unicode_call(name, args)
+            }
+        }
         Expr::Eq(lhs, rhs) => format!("{} = {}", unicode(lhs, 0), unicode(rhs, 0)),
         Expr::List(items) => format!(
             "{{{}}}",
@@ -447,14 +575,33 @@ fn latex(expr: &Expr, parent: i32) -> String {
         }
         Expr::Mul(factors) => paren(latex_mul(factors), PREC_MUL < parent, true),
         Expr::Pow(base, exp) => paren(latex_pow(base, exp), PREC_POW < parent, true),
-        Expr::Call(name, args) => format!(
-            "{}\\left({}\\right)",
-            name,
-            args.iter()
-                .map(|a| latex(a, 0))
-                .collect::<Vec<_>>()
-                .join(",\\; ")
-        ),
+        Expr::Call(name, args) => {
+            if let Some(text) = latex_logic(name, args) {
+                text
+            } else if let Some(op) = comparison_operator(name) {
+                if args.len() == 2 {
+                    let op = match op {
+                        "<=" => "\\le",
+                        ">=" => "\\ge",
+                        "!=" => "\\neq",
+                        other => other,
+                    };
+                    paren(
+                        format!(
+                            "{} {op} {}",
+                            latex(&args[0], PREC_CMP + 1),
+                            latex(&args[1], PREC_CMP + 1)
+                        ),
+                        PREC_CMP < parent,
+                        true,
+                    )
+                } else {
+                    latex_call(name, args)
+                }
+            } else {
+                latex_call(name, args)
+            }
+        }
         Expr::Eq(lhs, rhs) => format!("{} = {}", latex(lhs, 0), latex(rhs, 0)),
         Expr::List(items) => format!(
             "\\left\\{{ {} \\right\\}}",

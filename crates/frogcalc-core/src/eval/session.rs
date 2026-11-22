@@ -6,15 +6,23 @@ use num_traits::{Signed, ToPrimitive, Zero};
 
 use crate::calculus::{diff, integrate, integrate_definite};
 use crate::error::{CalcError, CalcResult};
-use crate::eval::approx::{approx_preview, to_approx_expr};
-use crate::numeric::{rat, rat_exact_decimal, rat_to_f64};
+use crate::eval::approx::{approx_preview, to_approx_expr, to_cnum};
+use crate::numeric::{rat, rat_exact_decimal, rat_from_recurring, rat_to_f64, BigFloat};
 use crate::parser::{parse, FunctionBody, Node, Statement};
 use crate::solve::solve_equation;
+use crate::symbolic::assume::{sign_from_comparison, Assumptions};
 use crate::symbolic::transform::{expand, factor, simplify};
 use crate::symbolic::{
     add, call_expr, collect_symbols, div, eq_expr, from_complex, has_float, integer, is_constant,
     list, mul, neg, node_count, num, pow, sub, sym, to_plain, to_unicode, zero, Expr,
 };
+
+/// 语句块执行后的控制流：正常值、break、continue。
+enum Flow {
+    Value(Expr),
+    Break,
+    Continue,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AngleMode {
@@ -144,11 +152,19 @@ const RESERVED: &[&str] = &[
     "or",
     "not",
     "range",
+    "piecewise",
+    "recurring",
+    "assume",
+    "assumptions",
+    "forget",
+    "clearassumptions",
     "if",
     "else",
     "while",
     "for",
     "in",
+    "break",
+    "continue",
 ];
 
 fn is_reserved(name: &str) -> bool {
@@ -160,10 +176,12 @@ pub struct Session {
     variables: BTreeMap<String, Expr>,
     functions: BTreeMap<String, UserFunction>,
     scopes: Vec<HashMap<String, Expr>>,
+    assumptions: Assumptions,
     ans: Expr,
     notes: Vec<String>,
     steps: usize,
     loop_steps: usize,
+    loop_depth: usize,
     call_depth: usize,
 }
 
@@ -180,10 +198,12 @@ impl Session {
             variables: BTreeMap::new(),
             functions: BTreeMap::new(),
             scopes: Vec::new(),
+            assumptions: Assumptions::new(),
             ans: zero(),
             notes: Vec::new(),
             steps: 0,
             loop_steps: 0,
+            loop_depth: 0,
             call_depth: 0,
         }
     }
@@ -194,6 +214,45 @@ impl Session {
             angle_mode: settings.angle_mode,
             display_mode: settings.display_mode,
         };
+    }
+
+    /// 绘图用：把一行表达式编译成 AST（只接受单条表达式或赋值右侧）。
+    pub fn compile_expression(&mut self, source: &str) -> CalcResult<Node> {
+        let program = parse(source)?;
+        let mut statements = program.statements.into_iter();
+        let statement = statements
+            .next()
+            .ok_or_else(|| CalcError::new("绘图需要一个表达式"))?;
+        if statements.next().is_some() {
+            return Err(CalcError::new("绘图只接受一个表达式"));
+        }
+        match statement {
+            Statement::Expr(node, _) | Statement::Assign(_, node, _) => Ok(node),
+            other => Err(CalcError::at("绘图需要一个表达式", statement_pos(&other))),
+        }
+    }
+
+    /// 绘图用：把变量绑定到具体数值后求值，返回实部；非有限值返回 `None`。
+    pub fn eval_sample(&mut self, node: &Node, bindings: &[(&str, f64)]) -> Option<f64> {
+        let mut frame = HashMap::new();
+        for (name, value) in bindings {
+            frame.insert(
+                (*name).to_string(),
+                Expr::Float(BigFloat::from_f64(*value, 24)?),
+            );
+        }
+        self.steps = 0;
+        self.loop_steps = 0;
+        self.call_depth = 0;
+        self.loop_depth = 0;
+        let value = self.eval_node(node, Some(&frame), 0).ok()?;
+        let value = to_cnum(&value, 24).ok()?;
+        let real = value.re.to_f64();
+        if real.is_finite() {
+            Some(real)
+        } else {
+            None
+        }
     }
 
     pub fn execute(&mut self, source: &str) -> Vec<ExecResult> {
@@ -321,10 +380,12 @@ impl Session {
                 self.eval_statement_value(statement)?;
                 Ok(None)
             }
+            Statement::Break { pos } => Err(CalcError::at("break 只能出现在循环体内", *pos)),
+            Statement::Continue { pos } => Err(CalcError::at("continue 只能出现在循环体内", *pos)),
         }
     }
 
-    fn eval_statement_value(&mut self, statement: &Statement) -> CalcResult<Expr> {
+    fn eval_statement_value(&mut self, statement: &Statement) -> CalcResult<Flow> {
         match statement {
             Statement::If {
                 cond,
@@ -342,15 +403,25 @@ impl Session {
             }
             Statement::While { cond, body, .. } => {
                 let mut last = zero();
-                loop {
-                    self.tick_loop(cond.pos())?;
-                    let value = self.eval_node(cond, None, 0)?;
-                    if !self.truthy(&value, cond.pos())? {
-                        break;
+                self.loop_depth += 1;
+                let outcome = (|| -> CalcResult<()> {
+                    loop {
+                        self.tick_loop(cond.pos())?;
+                        let value = self.eval_node(cond, None, 0)?;
+                        if !self.truthy(&value, cond.pos())? {
+                            break;
+                        }
+                        match self.eval_block_value(body)? {
+                            Flow::Value(value) => last = value,
+                            Flow::Continue => continue,
+                            Flow::Break => break,
+                        }
                     }
-                    last = self.eval_block_value(body)?;
-                }
-                Ok(last)
+                    Ok(())
+                })();
+                self.loop_depth = self.loop_depth.saturating_sub(1);
+                outcome?;
+                Ok(Flow::Value(last))
             }
             Statement::For {
                 var, iter, body, ..
@@ -366,36 +437,59 @@ impl Session {
                     }
                 };
                 let previous = self.var_scope_remove(var);
+                self.loop_depth += 1;
                 let outcome = (|| -> CalcResult<Expr> {
                     let mut last = zero();
                     for item in items {
                         self.tick_loop(iter.pos())?;
                         self.var_scope_set(var, item);
-                        last = self.eval_block_value(body)?;
+                        match self.eval_block_value(body)? {
+                            Flow::Value(value) => last = value,
+                            Flow::Continue => continue,
+                            Flow::Break => break,
+                        }
                     }
                     Ok(last)
                 })();
+                self.loop_depth = self.loop_depth.saturating_sub(1);
                 match previous {
                     Some(value) => self.var_scope_set(var, value),
                     None => {
                         let _ = self.var_scope_remove(var);
                     }
                 }
-                outcome
+                outcome.map(Flow::Value)
+            }
+            Statement::Break { pos } => {
+                if self.loop_depth == 0 {
+                    return Err(CalcError::at("break 只能出现在循环体内", *pos));
+                }
+                Ok(Flow::Break)
+            }
+            Statement::Continue { pos } => {
+                if self.loop_depth == 0 {
+                    return Err(CalcError::at("continue 只能出现在循环体内", *pos));
+                }
+                Ok(Flow::Continue)
             }
             _ => {
                 let outcome = self.eval_statement(statement)?;
-                Ok(outcome.map(|(_, _, value, _)| value).unwrap_or_else(zero))
+                Ok(Flow::Value(
+                    outcome.map(|(_, _, value, _)| value).unwrap_or_else(zero),
+                ))
             }
         }
     }
 
-    fn eval_block_value(&mut self, statements: &[Statement]) -> CalcResult<Expr> {
+    fn eval_block_value(&mut self, statements: &[Statement]) -> CalcResult<Flow> {
         let mut last = zero();
         for statement in statements {
-            last = self.eval_statement_value(statement)?;
+            match self.eval_statement_value(statement)? {
+                Flow::Value(value) => last = value,
+                other => return Ok(other),
+            }
         }
-        Ok(last)
+        Ok(Flow::Value(last))
     }
 
     fn var_scope_set(&mut self, name: &str, value: Expr) {
@@ -426,17 +520,21 @@ impl Session {
     }
 
     fn truthy(&self, value: &Expr, pos: usize) -> CalcResult<bool> {
+        self.truth_value(value).ok_or_else(|| {
+            CalcError::at("条件需要一个可判断真假的表达式，例如 x > 0、a and b", pos)
+        })
+    }
+
+    /// 与 `truthy` 相同，但无法判断真假时返回 `None` 而不是报错。
+    fn truth_value(&self, value: &Expr) -> Option<bool> {
         match value {
-            Expr::Num(v) => Ok(!v.is_zero()),
-            Expr::Float(v) => Ok(v.to_f64() != 0.0),
-            Expr::Sym(name) if name == "true" => Ok(true),
-            Expr::Sym(name) if name == "false" => Ok(false),
-            Expr::List(items) => Ok(!items.is_empty()),
-            Expr::Eq(left, right) => Ok(values_equal(left, right)),
-            _ => Err(CalcError::at(
-                "条件需要一个可判断真假的表达式，例如 x > 0、a and b",
-                pos,
-            )),
+            Expr::Num(v) => Some(!v.is_zero()),
+            Expr::Float(v) => Some(v.to_f64() != 0.0),
+            Expr::Sym(name) if name == "true" => Some(true),
+            Expr::Sym(name) if name == "false" => Some(false),
+            Expr::List(items) => Some(!items.is_empty()),
+            Expr::Eq(left, right) => Some(values_equal(left, right)),
+            _ => None,
         }
     }
 
@@ -561,6 +659,8 @@ impl Session {
                     self.node_source(iter),
                     self.statements_source(body, indent + 1)
                 ),
+                Statement::Break { .. } => format!("{pad}break"),
+                Statement::Continue { .. } => format!("{pad}continue"),
             };
             lines.push(text);
         }
@@ -732,6 +832,128 @@ impl Session {
                 };
                 Ok(bool_expr(value))
             }
+            "piecewise" => {
+                if args.len() < 2 {
+                    return Err(CalcError::at(
+                        "piecewise 至少需要 2 个参数：piecewise(条件, 值[, 条件, 值 ...][, 默认值])",
+                        pos,
+                    ));
+                }
+                let pairs = args.len() / 2;
+                let mut decided = true;
+                for i in 0..pairs {
+                    let condition = self.eval_node(&args[2 * i], locals, depth + 1);
+                    let verdict = match condition {
+                        Ok(value) => self.truth_value(&value),
+                        Err(_) => None,
+                    };
+                    match verdict {
+                        Some(true) => return self.eval_node(&args[2 * i + 1], locals, depth + 1),
+                        Some(false) => {}
+                        None => {
+                            decided = false;
+                            break;
+                        }
+                    }
+                }
+                if decided {
+                    if args.len() % 2 == 1 {
+                        return self.eval_node(&args[args.len() - 1], locals, depth + 1);
+                    }
+                    return Err(CalcError::at(
+                        "piecewise 没有分支匹配，也没有给出默认值",
+                        pos,
+                    ));
+                }
+                let mut values = Vec::with_capacity(args.len());
+                for (i, arg) in args.iter().enumerate() {
+                    if i % 2 == 0 && i / 2 < pairs {
+                        // 条件无法判定时保留条件的符号形式，便于显示与后续代入。
+                        values.push(self.node_to_expr(arg));
+                    } else {
+                        values.push(self.eval_node(arg, locals, depth + 1)?);
+                    }
+                }
+                Ok(call_expr("piecewise", values))
+            }
+            "recurring" => {
+                if args.len() != 1 {
+                    return Err(CalcError::at(
+                        "recurring 需要 1 个参数，例如 recurring(\"0.1(3)\")",
+                        pos,
+                    ));
+                }
+                let text = match &args[0] {
+                    Node::String(value, _) => value.clone(),
+                    _ => {
+                        let value = self.eval_node(&args[0], locals, depth + 1)?;
+                        match value {
+                            Expr::Str(text) => text,
+                            Expr::Num(v) => return Ok(num(v)),
+                            _ => {
+                                return Err(CalcError::at(
+                                    "recurring 需要一个字符串，例如 recurring(\"0.1(3)\")",
+                                    pos,
+                                ))
+                            }
+                        }
+                    }
+                };
+                let value =
+                    rat_from_recurring(&text).map_err(|message| CalcError::at(message, pos))?;
+                if text.contains('(') || text.contains('[') {
+                    self.notes
+                        .push(format!("“{text}” 已按循环小数转为精确分数"));
+                }
+                Ok(num(value))
+            }
+            "assume" => {
+                if args.is_empty() {
+                    return Err(CalcError::at(
+                        "assume 需要至少 1 个参数，例如 assume(x > 0)",
+                        pos,
+                    ));
+                }
+                for arg in args {
+                    self.apply_assumption(arg)?;
+                }
+                Ok(Expr::Str(self.assumption_summary()))
+            }
+            "assumptions" => {
+                if !args.is_empty() {
+                    return Err(CalcError::at("assumptions 不需要参数", pos));
+                }
+                Ok(Expr::Str(self.assumption_summary()))
+            }
+            "forget" => {
+                if args.is_empty() {
+                    return Err(CalcError::at("forget 需要变量名，例如 forget(x)", pos));
+                }
+                let names: CalcResult<Vec<String>> = args
+                    .iter()
+                    .map(|arg| {
+                        if let Node::Ident(name, _) = arg {
+                            Ok(name.clone())
+                        } else {
+                            self.resolve_var_name(arg)
+                        }
+                    })
+                    .collect();
+                let names = names?;
+                let mut lines = Vec::new();
+                for name in names {
+                    if self.assumptions.forget(&name) {
+                        lines.push(format!("已删除 {name} 的假设"));
+                    } else {
+                        lines.push(format!("{name} 没有假设"));
+                    }
+                }
+                Ok(Expr::Str(lines.join("\n")))
+            }
+            "clearassumptions" => {
+                self.assumptions.clear();
+                Ok(Expr::Str("已清除全部假设".into()))
+            }
             "range" => {
                 if args.len() < 2 || args.len() > 3 {
                     return Err(CalcError::at(
@@ -851,10 +1073,13 @@ impl Session {
                     return Err(CalcError::at(format!("{name} 需要 1 个参数"), pos));
                 }
                 let value = self.eval_node(&args[0], locals, depth + 1)?;
+                let value = self.assumptions.rewrite(&value);
                 match lower.as_str() {
-                    "simplify" => Ok(simplify(&value)),
-                    "expand" => expand(&value).map_err(|e| with_pos(e, pos)),
-                    _ => Ok(factor(&value)),
+                    "simplify" => Ok(self.assumptions.rewrite(&simplify(&value))),
+                    "expand" => expand(&value)
+                        .map(|v| self.assumptions.rewrite(&v))
+                        .map_err(|e| with_pos(e, pos)),
+                    _ => Ok(self.assumptions.rewrite(&factor(&value))),
                 }
             }
             "n" | "approx" => {
@@ -1008,9 +1233,16 @@ impl Session {
                         FunctionBody::Expr(node) => self.eval_node(node, Some(&frame), depth + 1),
                         FunctionBody::Block(statements) => {
                             self.scopes.push(frame);
+                            let saved_depth = self.loop_depth;
+                            self.loop_depth = 0;
                             let result = self.eval_block_value(statements);
+                            self.loop_depth = saved_depth;
                             self.scopes.pop();
-                            result
+                            match result {
+                                Ok(Flow::Value(value)) => Ok(value),
+                                Ok(_) => Err(CalcError::at("break / continue 不能跨函数使用", pos)),
+                                Err(error) => Err(error),
+                            }
                         }
                     };
                     self.call_depth -= 1;
@@ -1062,6 +1294,64 @@ impl Session {
         }
     }
 
+    /// 把 `assume(x > 0)`、`assume(x != 0)` 一类的条件转成内部假设。
+    fn apply_assumption(&mut self, node: &Node) -> CalcResult<()> {
+        match node {
+            Node::Ident(name, _) => {
+                self.assumptions.set_nonzero(name, true);
+                Ok(())
+            }
+            Node::Call(operator, operands, pos) if operands.len() == 2 => {
+                let key = operator.to_lowercase();
+                let (name, number, reversed) = match (&operands[0], &operands[1]) {
+                    (Node::Ident(name, _), Node::Number(value, _)) => {
+                        (name.clone(), value.clone(), false)
+                    }
+                    (Node::Number(value, _), Node::Ident(name, _)) => {
+                        (name.clone(), value.clone(), true)
+                    }
+                    _ => {
+                        return Err(CalcError::at(
+                            "assume 的条件应形如 x > 0（变量与 0 比较）",
+                            *pos,
+                        ))
+                    }
+                };
+                if !number.is_zero() {
+                    return Err(CalcError::at(
+                        "assume 目前只支持与 0 比较，例如 assume(x > 0)",
+                        *pos,
+                    ));
+                }
+                if key == "neq" {
+                    self.assumptions.set_nonzero(&name, true);
+                    return Ok(());
+                }
+                let sign = sign_from_comparison(&key, reversed)
+                    .ok_or_else(|| CalcError::at("assume 支持 >、>=、<、<= 比较", *pos))?;
+                self.assumptions.set(&name, sign);
+                Ok(())
+            }
+            other => Err(CalcError::at("assume 需要形如 x > 0 的条件", other.pos())),
+        }
+    }
+
+    fn assumption_summary(&self) -> String {
+        let entries = self.assumptions.describe();
+        if entries.is_empty() {
+            return "当前没有假设".into();
+        }
+        let mut lines = vec!["当前假设：".to_string()];
+        for (name, text) in entries {
+            lines.push(format!("  {name} {text}"));
+        }
+        lines.join("\n")
+    }
+
+    pub fn assumption_list(&self) -> Vec<(String, String)> {
+        self.assumptions.describe()
+    }
+
     fn deg_to_rad(&self, value: Expr) -> Expr {
         mul(vec![value, num(rat(1, 180)), sym("pi")])
     }
@@ -1071,6 +1361,13 @@ impl Session {
     }
 
     fn format_value(&self, value: &Expr, kind: &str) -> ExecResult {
+        // 假设只影响显示与显式 simplify，不改变工作区里保存的原始表达式。
+        let shown = if matches!(value, Expr::Str(_)) {
+            None
+        } else {
+            Some(self.assumptions.rewrite(value))
+        };
+        let value = shown.as_ref().unwrap_or(value);
         let plain = match value {
             Expr::Str(text) => text.clone(),
             _ => to_plain(value),
@@ -1158,12 +1455,22 @@ impl Session {
                 unicode: format!("{name}({})", function.params.join(", ")),
             });
         }
+        for (name, text) in self.assumptions.describe() {
+            items.push(WorkspaceItem {
+                name,
+                kind: "assumption".into(),
+                signature: None,
+                value_type: "假设".into(),
+                plain: text.clone(),
+                unicode: text,
+            });
+        }
         items.sort_by(|a, b| a.name.cmp(&b.name));
         items
     }
 
     pub fn workspace_source(&self) -> String {
-        let mut lines = Vec::new();
+        let mut lines: Vec<String> = self.assumptions.to_source();
         for (name, value) in &self.variables {
             match value {
                 Expr::Eq(lhs, rhs) => {
@@ -1185,11 +1492,13 @@ impl Session {
     pub fn remove_workspace_item(&mut self, name: &str) {
         self.variables.remove(name);
         self.functions.remove(name);
+        self.assumptions.forget(name);
     }
 
     pub fn clear_all(&mut self) {
         self.variables.clear();
         self.functions.clear();
+        self.assumptions.clear();
         self.ans = zero();
     }
 
@@ -1200,6 +1509,9 @@ impl Session {
         }
         for (name, function) in &self.functions {
             lines.push(format!("{name}({}) = 用户函数", function.params.join(", ")));
+        }
+        for (name, text) in self.assumptions.describe() {
+            lines.push(format!("assume {name} {text}"));
         }
         if lines.is_empty() {
             "工作区为空".into()
@@ -1219,6 +1531,10 @@ impl Session {
                 "  sqrt(2) * sqrt(2)   精确化简为 2",
                 "  diff / integrate / solve / simplify / expand / factor",
                 "  N(表达式, 位数)      近似求值",
+                "  piecewise(c1, v1, c2, v2, 默认) 分段函数",
+                "  recurring(\"0.1(3)\")  无限循环小数转精确分数",
+                "  assume(x > 0)       为变量添加假设，影响化简",
+                "  for / while 内可用 break / continue",
                 "  help(\"函数名\")       查看帮助",
                 "  # 这是注释",
                 "  分号 ; 可分隔语句并抑制输出",
@@ -1246,6 +1562,14 @@ impl Session {
             "subs" => "subs(表达式, 变量, 值)：符号替换。".into(),
             "setprecision" => "setprecision(n)：设置近似计算的精度位数。".into(),
             "setangle" => "setangle(\"deg\") 或 setangle(\"rad\")：切换角度制。".into(),
+            "piecewise" => "piecewise(条件1, 值1[, 条件2, 值2 ...][, 默认值])：分段函数。\n例如 f(x) = piecewise(x < 0, -x, x >= 0, x)。\n条件无法判定时会保留未求值形式。".into(),
+            "assume" => "assume(x > 0)：为变量添加符号假设（>、>=、<、<=、!=）。\n假设会影响 abs、sqrt(x^2) 等化简，并与工作区一起保存。\nassumptions() 查看，forget(x) 删除，clearassumptions() 全部清除。".into(),
+            "assumptions" => "assumptions()：列出当前所有变量假设。".into(),
+            "forget" => "forget(x)：删除变量 x 的假设。".into(),
+            "clearassumptions" => "clearassumptions()：清除全部变量假设。".into(),
+            "recurring" => "recurring(\"0.1(3)\")：把无限循环小数精确转换为分数。\n循环节用括号或方括号表示，例如 recurring(\"0.(3)\") = 1/3、recurring(\"-0.0[3]\") = -1/30。\n普通有限小数（如 recurring(\"2.5\")）也接受。结果直接保存为精确有理数。".into(),
+            "break" => "break：立即结束最内层 for / while 循环。".into(),
+            "continue" => "continue：跳过本次循环剩余语句，进入下一次迭代。".into(),
             _ => format!("没有找到 “{name}” 的帮助。试试 help(\"syntax\")。"),
         }
     }
@@ -1323,9 +1647,11 @@ fn statement_pos(statement: &Statement) -> usize {
     match statement {
         Statement::Expr(node, _) | Statement::Assign(_, node, _) => node.pos(),
         Statement::FuncDef(_, _, body, _) => body_pos(body),
-        Statement::If { pos, .. } | Statement::While { pos, .. } | Statement::For { pos, .. } => {
-            *pos
-        }
+        Statement::If { pos, .. }
+        | Statement::While { pos, .. }
+        | Statement::For { pos, .. }
+        | Statement::Break { pos }
+        | Statement::Continue { pos } => *pos,
     }
 }
 

@@ -58,6 +58,12 @@ pub enum Statement {
         suppress: bool,
         pos: usize,
     },
+    Break {
+        pos: usize,
+    },
+    Continue {
+        pos: usize,
+    },
 }
 
 impl Statement {
@@ -102,6 +108,8 @@ impl Statement {
                 suppress,
                 pos,
             },
+            Statement::Break { pos } => Statement::Break { pos },
+            Statement::Continue { pos } => Statement::Continue { pos },
         }
     }
 }

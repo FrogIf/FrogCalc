@@ -5,8 +5,10 @@
 pub mod calculus;
 pub mod error;
 pub mod eval;
+pub mod factor_int;
 pub mod numeric;
 pub mod parser;
+pub mod plot;
 pub mod polynomial;
 pub mod solve;
 pub mod symbolic;

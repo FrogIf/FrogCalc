@@ -65,6 +65,18 @@ fn diff_raw(expr: &Expr, var: &str) -> Expr {
                 ]),
             ])
         }
+        Expr::Call(name, args) if name.eq_ignore_ascii_case("piecewise") => {
+            let pairs = args.len() / 2;
+            let mut out = Vec::with_capacity(args.len());
+            for (i, arg) in args.iter().enumerate() {
+                if i % 2 == 0 && i / 2 < pairs {
+                    out.push(arg.clone());
+                } else {
+                    out.push(diff_raw(arg, var));
+                }
+            }
+            call_expr("piecewise", out)
+        }
         Expr::Call(name, args) => {
             if args.len() != 1 {
                 return call_expr("diff", vec![expr.clone(), sym(var)]);

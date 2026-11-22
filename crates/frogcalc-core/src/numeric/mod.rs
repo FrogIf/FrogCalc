@@ -1,9 +1,11 @@
 pub mod bigfloat;
+pub mod recurring;
 
 pub use bigfloat::BigFloat;
 pub use num_bigint::{BigInt, BigUint, Sign};
 pub use num_rational::BigRational;
 pub use num_traits::{One, Signed, ToPrimitive, Zero};
+pub use recurring::rat_from_recurring;
 
 use num_integer::Integer;
 

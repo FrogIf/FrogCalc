@@ -6,6 +6,7 @@ use num_bigint::BigInt;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use crate::error::{CalcError, CalcResult};
+use crate::factor_int::factor_squarefree_integer;
 use crate::numeric::{rat, rat_to_f64, rational_gcd, BigFloat, Rat};
 use crate::symbolic::{add, integer, key, mul, num, pow, sub, sym, Expr};
 
@@ -505,39 +506,25 @@ pub fn solve_poly(poly: &Poly) -> CalcResult<Vec<Expr>> {
     if degree == 2 {
         return Ok(quadratic_roots(&p));
     }
-    let mut current = p.clone();
-    let mut exact = Vec::new();
-    for root in rational_roots(&p) {
-        if poly_degree(&current).unwrap_or(0) == 0 {
-            break;
-        }
-        let factor = Poly {
-            var: p.var.clone(),
-            coeffs: vec![-root.clone(), Rat::one()],
-        };
-        if let Ok((q, r)) = poly_div_mod(&current, &factor) {
-            if poly_is_zero(&r) {
-                exact.push(num(root));
-                current = poly_trim(&q);
+    // 先做因式分解：一次/二次因子给出精确根，剩下的高次因子才退回数值求根。
+    let mut roots = Vec::new();
+    match factor_poly(&p) {
+        Ok(result) if !result.factors.is_empty() => {
+            for (factor, _) in &result.factors {
+                match poly_degree(factor) {
+                    Some(0) | None => {}
+                    Some(1) => roots.push(num(-&factor.coeffs[0] / &factor.coeffs[1])),
+                    Some(2) => roots.extend(quadratic_roots(factor)),
+                    Some(_) => roots.extend(numeric_roots(factor)),
+                }
             }
         }
+        _ => roots.extend(numeric_roots(&p)),
     }
-    match poly_degree(&current) {
-        None => Ok(dedupe(exact)),
-        Some(0) => Ok(dedupe(exact)),
-        Some(1) => {
-            exact.push(num(-&current.coeffs[0] / &current.coeffs[1]));
-            Ok(dedupe(exact))
-        }
-        Some(2) => {
-            exact.extend(quadratic_roots(&current));
-            Ok(dedupe(exact))
-        }
-        _ => {
-            exact.extend(numeric_roots(&current));
-            Ok(dedupe(exact))
-        }
+    if roots.is_empty() {
+        roots.extend(numeric_roots(&p));
     }
+    Ok(dedupe(roots))
 }
 
 pub struct FactorResult {
@@ -546,14 +533,14 @@ pub struct FactorResult {
 }
 
 pub fn factor_poly(poly: &Poly) -> CalcResult<FactorResult> {
-    let mut p = poly_trim(poly);
-    if poly_is_zero(&p) {
+    let original = poly_trim(poly);
+    if poly_is_zero(&original) {
         return Ok(FactorResult {
             content: Rat::one(),
             factors: Vec::new(),
         });
     }
-    let content = p
+    let content = original
         .coeffs
         .iter()
         .fold(Rat::zero(), |g, c| rational_gcd(&g, c));
@@ -562,29 +549,161 @@ pub fn factor_poly(poly: &Poly) -> CalcResult<FactorResult> {
     } else {
         content.abs()
     };
-    p = poly_scale(&p, &content.recip());
+    let scaled = poly_scale(&original, &content.recip());
+    let mut factors: Vec<(Poly, u32)> = Vec::new();
+    for (part, multiplicity) in squarefree_parts(&scaled) {
+        let mut remaining = part;
+        let (root_factors, rest) = extract_rational_roots(&remaining);
+        factors.extend(root_factors.into_iter().map(|f| (f, multiplicity)));
+        remaining = rest;
+        if poly_degree(&remaining).unwrap_or(0) <= 0 {
+            continue;
+        }
+        let integer = match poly_to_integers(&remaining) {
+            Some(value) => value,
+            None => {
+                factors.push((remaining, multiplicity));
+                continue;
+            }
+        };
+        match factor_squarefree_integer(&integer) {
+            Some(parts) if !parts.is_empty() => {
+                for factor in parts {
+                    let poly = Poly {
+                        var: remaining.var.clone(),
+                        coeffs: factor
+                            .iter()
+                            .map(|c| Rat::from_integer(c.clone()))
+                            .collect(),
+                    };
+                    factors.push((poly_trim(&poly), multiplicity));
+                }
+            }
+            _ => factors.push((remaining, multiplicity)),
+        }
+    }
+    factors.retain(|(f, m)| poly_degree(f).unwrap_or(0) > 0 && *m > 0);
+    if factors.is_empty() {
+        return Ok(FactorResult {
+            content,
+            factors: Vec::new(),
+        });
+    }
+    let mut product = poly_constant(&original.var, Rat::one());
+    for (factor, multiplicity) in &factors {
+        for _ in 0..*multiplicity {
+            product = poly_mul(&product, factor)?;
+        }
+    }
+    let (quotient, remainder) = poly_div_mod(&scaled, &product)?;
+    let constant = if poly_is_zero(&remainder) && poly_degree(&quotient).unwrap_or(0) == 0 {
+        quotient.coeffs.first().cloned().unwrap_or_else(Rat::one)
+    } else {
+        // 结果无法验证时退回“不分解”，保证正确性优先。
+        return Ok(FactorResult {
+            content,
+            factors: vec![(scaled, 1)],
+        });
+    };
+    Ok(FactorResult {
+        content: content * constant,
+        factors,
+    })
+}
+
+/// Yun 算法：把一元多项式拆成 square-free 部分，附带重数。
+pub fn squarefree_parts(poly: &Poly) -> Vec<(Poly, u32)> {
+    let f = poly_monic(poly);
+    if poly_degree(&f).unwrap_or(0) <= 0 {
+        return Vec::new();
+    }
+    let derivative = poly_derivative(&f);
+    let Ok(mut g) = poly_gcd(&f, &derivative) else {
+        return vec![(f, 1)];
+    };
+    let Ok((mut w, _)) = poly_div_mod(&f, &g) else {
+        return vec![(f, 1)];
+    };
+    let mut out = Vec::new();
+    let mut multiplicity = 1u32;
+    while poly_degree(&w).unwrap_or(0) > 0 {
+        let Ok(y) = poly_gcd(&w, &g) else { break };
+        let Ok((z, _)) = poly_div_mod(&w, &y) else {
+            break;
+        };
+        if poly_degree(&z).unwrap_or(0) > 0 {
+            out.push((poly_monic(&z), multiplicity));
+        }
+        w = y.clone();
+        g = match poly_div_mod(&g, &y) {
+            Ok((quotient, _)) => quotient,
+            _ => break,
+        };
+        multiplicity += 1;
+        if multiplicity > 200 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        out.push((f, 1));
+    }
+    out
+}
+
+fn extract_rational_roots(poly: &Poly) -> (Vec<Poly>, Poly) {
+    let mut remaining = poly_trim(poly);
     let mut factors = Vec::new();
-    for root in rational_roots(&p) {
+    for root in rational_roots(&remaining) {
         let factor = Poly {
-            var: p.var.clone(),
+            var: remaining.var.clone(),
             coeffs: vec![-root, Rat::one()],
         };
-        let mut mult = 0;
-        while let Ok((q, r)) = poly_div_mod(&p, &factor) {
-            if !poly_is_zero(&r) {
+        loop {
+            let Ok((quotient, remainder)) = poly_div_mod(&remaining, &factor) else {
+                break;
+            };
+            if !poly_is_zero(&remainder) {
                 break;
             }
-            p = poly_trim(&q);
-            mult += 1;
-        }
-        if mult > 0 {
-            factors.push((factor, mult));
+            factors.push(factor.clone());
+            remaining = poly_trim(&quotient);
         }
     }
-    if poly_degree(&p).unwrap_or(0) > 0 {
-        factors.push((p, 1));
+    (factors, remaining)
+}
+
+fn poly_to_integers(poly: &Poly) -> Option<Vec<BigInt>> {
+    use num_integer::Integer;
+    let mut denominator_lcm = BigInt::one();
+    for coeff in &poly.coeffs {
+        denominator_lcm = denominator_lcm.lcm(coeff.denom());
     }
-    Ok(FactorResult { content, factors })
+    let mut out: Vec<BigInt> = poly
+        .coeffs
+        .iter()
+        .map(|coeff| {
+            let scaled = coeff * Rat::from_integer(denominator_lcm.clone());
+            scaled.numer().clone()
+        })
+        .collect();
+    let mut gcd = BigInt::zero();
+    for coeff in &out {
+        gcd = gcd.gcd(coeff);
+    }
+    if !gcd.is_zero() && !gcd.is_one() {
+        for coeff in out.iter_mut() {
+            *coeff /= &gcd;
+        }
+    }
+    if out.last().map(|c| c.is_negative()).unwrap_or(false) {
+        for coeff in out.iter_mut() {
+            *coeff = -coeff.clone();
+        }
+    }
+    while out.last().map(|c| c.is_zero()).unwrap_or(false) {
+        out.pop();
+    }
+    Some(out)
 }
 
 pub fn numeric_square_root_rational(value: &Rat) -> Option<Rat> {
