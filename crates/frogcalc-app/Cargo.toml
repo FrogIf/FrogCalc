@@ -1,0 +1,26 @@
+[package]
+name = "frogcalc-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "FrogCalc 原生桌面计算器"
+
+[[bin]]
+name = "frogcalc"
+path = "src/main.rs"
+
+[dependencies]
+frogcalc-core = { path = "../frogcalc-core" }
+eframe = { version = "0.37", default-features = false, features = [
+    "wgpu",
+    "default_fonts",
+    "system_fonts",
+    "clipboard",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+embed-resource = "3.0.12"

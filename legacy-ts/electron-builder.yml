@@ -1,0 +1,23 @@
+appId: com.frogcalc.app
+productName: FrogCalc
+copyright: Copyright © 2026 FrogCalc
+directories:
+  output: release
+  buildResources: resources
+files:
+  - out/**/*
+  - package.json
+win:
+  icon: resources/icon.ico
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: FrogCalc
+portable:
+  artifactName: FrogCalc-${version}-portable.exe

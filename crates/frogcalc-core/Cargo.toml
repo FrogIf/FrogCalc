@@ -1,0 +1,15 @@
+[package]
+name = "frogcalc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "FrogCalc 的精确数值与计算机代数内核"
+
+[dependencies]
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+num-integer.workspace = true
+
+[dev-dependencies]

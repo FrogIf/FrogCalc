@@ -1,0 +1,36 @@
+{
+  "name": "frogcalc",
+  "version": "0.1.0",
+  "description": "FrogCalc — 精确优先的桌面计算器与计算机代数系统",
+  "main": "./out/main/index.js",
+  "author": "FrogCalc",
+  "license": "MIT",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "dist": "electron-vite build && electron-builder --win",
+    "dist:portable": "electron-vite build && electron-builder --win portable"
+  },
+  "dependencies": {
+    "katex": "^0.19.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0",
+    "electron-vite": "^5.0.0",
+    "fast-check": "^4.10.3",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.8",
+    "vitest": "^5.1.1"
+  }
+}
