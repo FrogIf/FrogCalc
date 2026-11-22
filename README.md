@@ -270,14 +270,13 @@ crates/
 │  ├─ solve.rs                 方程求解与逆运算
 │  └─ eval/                    求值会话、近似求值、结果格式化
 └─ frogcalc-app/               egui/eframe 原生界面
-legacy-ts/                     旧 TypeScript + Electron 版本（仅作参考）
 docs/ALGORITHMS.md             数学原理与算法文档
 ```
 
 - 计算内核完全不依赖 UI，可复用于 CLI、服务端或其他前端。
 - 界面采用 eframe 的 **wgpu** 后端；中式字体在启动时从系统加载（SimHei / DengXian / Microsoft YaHei）。
 - 状态保存在程序所在目录的 `state.json`（便携模式）；首次运行会从旧的 `%APPDATA%\FrogCalc\state.json` 自动迁移，并把旧文件改名为 `state.json.bak`。
-- 旧 Electron/React 版本已移动到 `legacy-ts/`，不再参与构建。
+- 旧 Electron/React 版本已从仓库移除（其实现已被 `crates/frogcalc-core` 完全取代，需要时可从 git 历史提交 `077f4dc` 中取回）。
 
 ## 测试
 

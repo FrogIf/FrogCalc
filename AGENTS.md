@@ -4,7 +4,6 @@
 
 - Rust workspace: `crates/frogcalc-core` (pure math/CAS, no UI deps) + `crates/frogcalc-app` (egui/eframe native UI).
 - All math, parsing, CAS, formatting logic belongs in `frogcalc-core`; the app only handles UI, persistence, and display.
-- `legacy-ts/` is the old TypeScript + Electron implementation. It is not built and has no `node_modules`; do not edit it unless explicitly asked.
 - `README.md` documents the language and build flow; `docs/ALGORITHMS.md` is the algorithm/reference document. Keep both in sync when changing behavior.
 
 ## Commands
